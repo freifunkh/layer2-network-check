@@ -1,0 +1,18 @@
+[package]
+name = "network-test"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp/", features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface", "proto-ipv4", "proto-dhcpv4", "socket-raw", "async"] }
+log = "0.4"
+env_logger = "0.10"
+getopts = "0.2"
+rand = "0.8"
+url = "2.0"
+
+[features]
+log = []
+default = ["log"]
