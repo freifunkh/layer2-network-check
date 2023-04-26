@@ -14,6 +14,53 @@ use smoltcp::{
 };
 use smoltcp::socket::icmp;
 
+use std::str::FromStr;
+
+use byteorder::{ByteOrder, NetworkEndian};
+use std::cmp;
+use std::collections::HashMap;
+
+use smoltcp::wire::{
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress
+};
+
+
+macro_rules! send_icmp_ping {
+    ( $repr_type:ident, $packet_type:ident, $ident:expr, $seq_no:expr,
+      $echo_payload:expr, $socket:expr, $remote_addr:expr ) => {{
+        let icmp_repr = $repr_type::EchoRequest {
+            ident: $ident,
+            seq_no: $seq_no,
+            data: &$echo_payload,
+        };
+
+        let icmp_payload = $socket.send(icmp_repr.buffer_len(), $remote_addr).unwrap();
+
+        let icmp_packet = $packet_type::new_unchecked(icmp_payload);
+        (icmp_repr, icmp_packet)
+    }};
+}
+
+macro_rules! get_icmp_pong {
+    ( $repr_type:ident, $repr:expr, $payload:expr, $waiting_queue:expr, $remote_addr:expr,
+      $timestamp:expr, $received:expr ) => {{
+        if let $repr_type::EchoReply { seq_no, data, .. } = $repr {
+            if let Some(_) = $waiting_queue.get(&seq_no) {
+                let packet_timestamp_ms = NetworkEndian::read_i64(data);
+                println!(
+                    "{} bytes from {}: icmp_seq={}, time={}ms",
+                    data.len(),
+                    $remote_addr,
+                    seq_no,
+                    $timestamp.total_millis() - packet_timestamp_ms
+                );
+                $waiting_queue.remove(&seq_no);
+                $received += 1;
+            }
+        }
+    }};
+}
+
 fn main() {
     #[cfg(feature = "log")]
     utils::setup_logging("");
@@ -22,9 +69,46 @@ fn main() {
     utils::add_tuntap_options(&mut opts, &mut free);
     utils::add_middleware_options(&mut opts, &mut free);
 
+    opts.optopt(
+        "c",
+        "count",
+        "Amount of echo request packets to send (default: 4)",
+        "COUNT",
+    );
+    opts.optopt(
+        "i",
+        "interval",
+        "Interval between successive packets sent (seconds) (default: 1)",
+        "INTERVAL",
+    );
+    opts.optopt(
+        "",
+        "timeout",
+        "Maximum wait duration for an echo response packet (seconds) (default: 5)",
+        "TIMEOUT",
+    );
+    free.push("ADDRESS");
+
     let mut matches = utils::parse_options(&opts, free);
     //let device = utils::parse_tuntap_options(&mut matches);
     let device = RawSocket::new("wlp3s0", Medium::Ethernet).unwrap();
+
+    let device_caps = device.capabilities();
+    let remote_addr = IpAddress::from_str(&matches.free[0]).expect("invalid address format");
+    let count = matches
+        .opt_str("count")
+        .map(|s| usize::from_str(&s).unwrap())
+        .unwrap_or(4);
+    let interval = matches
+        .opt_str("interval")
+        .map(|s| Duration::from_secs(u64::from_str(&s).unwrap()))
+        .unwrap_or_else(|| Duration::from_secs(1));
+    let timeout = Duration::from_secs(
+        matches
+            .opt_str("timeout")
+            .map(|s| u64::from_str(&s).unwrap())
+            .unwrap_or(5),
+    );
 
     let fd = device.as_raw_fd();
     let mut device =
@@ -234,8 +318,13 @@ fn main() {
 
 fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
     iface.update_ip_addrs(|addrs| {
-        if let Some(dest) = addrs.iter_mut().next() {
-            *dest = IpCidr::Ipv4(cidr);
+        if cidr.address() == Ipv4Address::UNSPECIFIED {
+            return;
         }
+
+        addrs
+            .push(IpCidr::Ipv4(cidr))
+            .unwrap();
+        println!("configured IP {}....", cidr);
     });
 }
