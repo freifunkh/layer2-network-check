@@ -7,7 +7,9 @@ use getopts::{Matches, Options};
 use log::{trace, Level, LevelFilter};
 use std::env;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
+#[cfg(feature = "log")]
+use std::io::Write;
 use std::process;
 use std::str::{self, FromStr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use smoltcp::phy::TunTapInterface;
 use smoltcp::phy::{Device, FaultInjector, Medium, Tracer};
 use smoltcp::phy::{PcapMode, PcapWriter};
-use smoltcp::time::{Duration, Instant};
+
+use smoltcp::time::Duration;
+#[cfg(feature = "log")]
+use smoltcp::time::Instant;
 
 #[cfg(feature = "log")]
 pub fn setup_logging_with_clock<F>(filter: &str, since_startup: F)

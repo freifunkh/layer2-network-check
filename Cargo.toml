@@ -16,4 +16,4 @@ byteorder = "1.4.3"
 
 [features]
 log = []
-default = ["log"]
+default = []
