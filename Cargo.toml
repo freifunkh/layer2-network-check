@@ -14,7 +14,7 @@ path = "src/main_ipv6.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp/", features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface", "proto-ipv4", "proto-dhcpv4", "socket-raw", "async"] }
+smoltcp = { path="../smoltcp", features = ["std", "medium-ethernet", "medium-ip", "phy-tuntap_interface", "proto-ipv4", "proto-dhcpv4", "socket-raw", "async"] }
 log = "0.4"
 env_logger = "0.10"
 getopts = "0.2"
