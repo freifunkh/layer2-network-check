@@ -2,7 +2,6 @@
 mod utils;
 
 use std::os::unix::io::AsRawFd;
-use std::net::Ipv6Addr;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::dhcpv4;
@@ -86,10 +85,6 @@ fn main() {
 
     // Mac is: e8:b1:fc:f6:4d:16
     let mac = EthernetAddress([0xe8, 0xb1, 0xfc, 0xf6, 0x4d, 0x16]);
-
-    let eui64 = mac_as_eui64(&mac);
-
-    println!("{:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}", eui64[0], eui64[1], eui64[2], eui64[3], eui64[4], eui64[5], eui64[6], eui64[7]);
 
     // Create interface
     let mut config = match device.capabilities().medium {
