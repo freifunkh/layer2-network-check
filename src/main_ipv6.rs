@@ -159,7 +159,14 @@ fn main() {
         }
 
         if socket.can_recv() {
-            let (payload, _) = socket.recv().unwrap();
+            let (payload, source_addr) = socket.recv().unwrap();
+
+            let ip6_source_addr = match source_addr {
+                IpAddress::Ipv6(ip6) => ip6,
+                _ => {
+                    break;
+                }
+            };
 
             let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
             let x = NdiscRepr::parse(&icmp_packet).unwrap();
@@ -190,6 +197,7 @@ fn main() {
 
                         if ipv6_is_global(&ip6) {
                             selected_ip = Some(ip6);
+                            selected_router = Some(ip6_source_addr);
                         }
                     }
                 }
@@ -227,4 +235,7 @@ fn main() {
 
         phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
     }
+
+    println!("Assigned IP: {}", selected_ip.unwrap());
+    println!("Assigned Router: {}", selected_router.unwrap());
 }
