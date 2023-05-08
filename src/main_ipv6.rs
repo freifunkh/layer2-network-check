@@ -14,7 +14,7 @@ use smoltcp::{
 use smoltcp::socket::icmp;
 
 use smoltcp::wire::{
-    Icmpv6Packet, NdiscRepr
+    Icmpv6Packet, NdiscRepr, Ipv6Cidr
 };
 
 
@@ -126,7 +126,7 @@ fn main() {
     let mut send_at = Instant::from_millis(0);
 
     let mut sent = false;
-    let mut selected_ip : Option<Ipv6Address> = None;
+    let mut selected_ip : Option<Ipv6Cidr> = None;
     let mut selected_router : Option<Ipv6Address> = None;
 
     loop {
@@ -196,7 +196,7 @@ fn main() {
                         }
 
                         if ipv6_is_global(&ip6) {
-                            selected_ip = Some(ip6);
+                            selected_ip = Some(Ipv6Cidr::new(ip6, prefix_len));
                             selected_router = Some(ip6_source_addr);
                         }
                     }
@@ -238,4 +238,21 @@ fn main() {
 
     println!("Assigned IP: {}", selected_ip.unwrap());
     println!("Assigned Router: {}", selected_router.unwrap());
+
+    set_ipv6_addr(&mut iface, selected_ip.unwrap());
+
+    iface.routes_mut().add_default_ipv6_route(selected_router.unwrap()).unwrap();
+}
+
+fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
+    iface.update_ip_addrs(|addrs| {
+        if cidr.address() == Ipv6Address::UNSPECIFIED {
+            return;
+        }
+
+        addrs
+            .push(IpCidr::Ipv6(cidr))
+            .unwrap();
+        println!("configured IP {}....", cidr);
+    });
 }
