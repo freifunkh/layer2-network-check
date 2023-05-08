@@ -126,6 +126,8 @@ fn main() {
     let mut send_at = Instant::from_millis(0);
 
     let mut sent = false;
+    let mut selected_ip : Option<Ipv6Address> = None;
+    let mut selected_router : Option<Ipv6Address> = None;
 
     loop {
         let timestamp = Instant::now();
@@ -145,7 +147,7 @@ fn main() {
         if !sent && socket.can_send() && send_at <= timestamp {
 
             let icmp_repr = NdiscRepr::RouterSolicit {
-                lladdr: None
+                lladdr: Some(mac.into())
             };
     
             let icmp_payload = socket.send(icmp_repr.buffer_len(), remote_addr.into_address()).unwrap();
@@ -164,8 +166,14 @@ fn main() {
 
             println!("can_recv()");
 
-            if let NdiscRepr::RouterAdvert { prefix_infos, .. } = x {
+            if let NdiscRepr::RouterAdvert { prefix_infos, router_lifetime, .. } = x {
                 println!("RA received.");
+
+                if router_lifetime.secs() == 0 {
+                    println!("No default router.");
+                }
+
+                println!("Router lifetime: {}", router_lifetime.secs());
 
                 for i in 0..8 {
                     if let Some(NdiscPrefixInformation { prefix, prefix_len, .. }) = prefix_infos[i] {
@@ -175,6 +183,14 @@ fn main() {
                         println!("IP: {}", ip6);
 
                         println!("Is global? {}", ipv6_is_global(&ip6));
+
+                        if prefix_len != 64 {
+                            println!("Prefix length must be 64.");
+                        }
+
+                        if ipv6_is_global(&ip6) {
+                            selected_ip = Some(ip6);
+                        }
                     }
                 }
             }
@@ -204,6 +220,11 @@ fn main() {
         //         phy_wait(fd, Some(send_at - timestamp)).expect("wait error");
         //     }
         // }
+
+        if selected_ip.is_some() {
+            break;
+        }
+
         phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
     }
 }
