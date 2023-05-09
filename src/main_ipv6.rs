@@ -105,15 +105,26 @@ fn main() {
         "destination to send RA to",
         "LL_ADDR",
     );
+    opts.optopt(
+        "i",
+        "interface",
+        "iface to open raw socket on",
+        "IFACE"
+    );
 
-    let remote_addr = opts.parse(env::args().skip(1)).unwrap()
+    let args = opts.parse(env::args().skip(1)).unwrap();
+
+    let remote_addr = args
         .opt_str("remote")
         .map(|s| Ipv6Address::from_str(&s).unwrap())
         .unwrap_or(Ipv6Address::LINK_LOCAL_ALL_ROUTERS);
+    let iface_name = args
+        .opt_str("interface")
+        .unwrap_or("wlp3s0".into());
 
     let mut matches = utils::parse_options(&opts, free);
     //let device = utils::parse_tuntap_options(&mut matches);
-    let device = RawSocket::new("wlp3s0", Medium::Ethernet).unwrap();
+    let device = RawSocket::new(&iface_name, Medium::Ethernet).unwrap();
 
     let fd = device.as_raw_fd();
     let mut device =
