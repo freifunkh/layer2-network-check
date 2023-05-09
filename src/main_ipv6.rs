@@ -57,7 +57,7 @@ macro_rules! get_icmp_pong {
     }};
 }
 
-
+const IPV6_PREFIX_LINK_LOCAL_UNICAST : Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
 const EUI64_MIDDLE_VALUE: [u8; 2] = [0xff, 0xfe];
 
 pub fn mac_as_eui64(mac: &EthernetAddress) -> [u8; 8] {
@@ -148,12 +148,17 @@ fn main() {
     dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(100)));
 
     let mut sockets = SocketSet::new(vec![]);
-
+    let ll_prefix = &IPV6_PREFIX_LINK_LOCAL_UNICAST;
+    let ll_addr = IpCidr::new(
+        ipv6_from_prefix(ll_prefix, &mac).into_address(),
+        64
+    );
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs
-            .push(IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 13, 37), 64))
+            .push(ll_addr.clone())
             .unwrap();
     });
+    println!("Assigned IP: {}", ll_addr);
 
     let remote_addr = Ipv6Address::LINK_LOCAL_ALL_ROUTERS;
 
