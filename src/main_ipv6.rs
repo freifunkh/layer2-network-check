@@ -21,6 +21,9 @@ use smoltcp::wire::{
 
 use byteorder::{ByteOrder, NetworkEndian};
 
+use core::str::FromStr;
+use std::env;
+
 macro_rules! send_icmp_ping {
     ( $repr_type:ident, $packet_type:ident, $ident:expr, $seq_no:expr,
       $echo_payload:expr, $socket:expr, $remote_addr:expr ) => {{
@@ -97,23 +100,16 @@ fn main() {
     utils::add_middleware_options(&mut opts, &mut free);
 
     opts.optopt(
-        "c",
-        "count",
-        "Amount of echo request packets to send (default: 4)",
-        "COUNT",
+        "r",
+        "remote",
+        "destination to send RA to",
+        "LL_ADDR",
     );
-    opts.optopt(
-        "i",
-        "interval",
-        "Interval between successive packets sent (seconds) (default: 1)",
-        "INTERVAL",
-    );
-    opts.optopt(
-        "",
-        "timeout",
-        "Maximum wait duration for an echo response packet (seconds) (default: 5)",
-        "TIMEOUT",
-    );
+
+    let remote_addr = opts.parse(env::args().skip(1)).unwrap()
+        .opt_str("remote")
+        .map(|s| Ipv6Address::from_str(&s).unwrap())
+        .unwrap_or(Ipv6Address::LINK_LOCAL_ALL_ROUTERS);
 
     let mut matches = utils::parse_options(&opts, free);
     //let device = utils::parse_tuntap_options(&mut matches);
@@ -160,8 +156,6 @@ fn main() {
     });
     println!("Assigned IP: {}", ll_addr);
 
-    let remote_addr = Ipv6Address::LINK_LOCAL_ALL_ROUTERS;
-
     // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
@@ -201,6 +195,8 @@ fn main() {
 
             icmp_repr.emit(&mut icmp_packet);
             sent = true;
+
+            println!("Sent RS to {}", remote_addr);
         }
 
         if socket.can_recv() {
