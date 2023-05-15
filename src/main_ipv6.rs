@@ -95,8 +95,6 @@ pub fn ipv6_is_global(ip: &Ipv6Address) -> bool {
 }
 
 fn main() {
-    #[cfg(feature = "log")]
-    utils::setup_logging("");
 
     let (mut opts, mut free) = utils::create_options();
     utils::add_tuntap_options(&mut opts, &mut free);
@@ -121,8 +119,21 @@ fn main() {
         "MAC"
     );
 
+    #[cfg(feature = "log")] {
+        opts.optflag(
+            "l",
+            "log",
+            "do extensive logging"
+        );
+    }
 
     let args = opts.parse(env::args().skip(1)).unwrap();
+
+    #[cfg(feature = "log")] {
+        if args.opt_present("l") {
+            utils::setup_logging("");
+        }
+    }
 
     let remote_addr = args
         .opt_str("remote")
