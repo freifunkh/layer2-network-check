@@ -96,7 +96,6 @@ pub fn ipv6_is_global(ip: &Ipv6Address) -> bool {
 fn main() {
 
     let (mut opts, mut free) = utils::create_options();
-    utils::add_tuntap_options(&mut opts, &mut free);
     utils::add_middleware_options(&mut opts, &mut free);
 
     opts.optopt(
