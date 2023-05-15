@@ -286,6 +286,8 @@ fn main() {
         phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
     }
 
+    sockets.remove(icmp_handle);
+
     println!("Assigned IP: {}", selected_ip.unwrap());
     println!("Assigned Router: {}", selected_router.unwrap());
 
