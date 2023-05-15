@@ -265,6 +265,7 @@ fn main() {
 
                 if router_lifetime.secs() == 0 {
                     println!("No default router.");
+                    continue;
                 }
 
                 println!("Router lifetime: {}", router_lifetime.secs());
