@@ -24,6 +24,9 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::str::FromStr;
 use std::env;
 
+use std::fs;
+use std::path::Path;
+
 macro_rules! send_icmp_ping {
     ( $repr_type:ident, $packet_type:ident, $ident:expr, $seq_no:expr,
       $echo_payload:expr, $socket:expr, $remote_addr:expr ) => {{
@@ -111,6 +114,13 @@ fn main() {
         "iface to open raw socket on",
         "IFACE"
     );
+    opts.optopt(
+        "m",
+        "mac",
+        "mac to use for the raw socket",
+        "MAC"
+    );
+
 
     let args = opts.parse(env::args().skip(1)).unwrap();
 
@@ -130,8 +140,19 @@ fn main() {
     let mut device =
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
 
-    // Mac is: e8:b1:fc:f6:4d:16
-    let mac = EthernetAddress([0xe8, 0xb1, 0xfc, 0xf6, 0x4d, 0x16]);
+    let mac_str = match args.opt_str("mac") {
+        Some(mac_str) => mac_str,
+        None => {
+            let mac_str_file_content = fs::read_to_string(
+                Path::new("/sys/class/net/")
+                    .join(iface_name)
+                    .join("address")).unwrap();
+            mac_str_file_content.strip_suffix("\n").unwrap().to_owned()
+        }
+    };
+
+    let mac = EthernetAddress::from_str(mac_str.as_str()).unwrap();
+    println!("Using MAC: {}.", mac_str);
 
     // Create interface
     let mut config = match device.capabilities().medium {
