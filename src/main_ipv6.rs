@@ -223,8 +223,6 @@ fn main() {
             let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
             let x = NdiscRepr::parse(&icmp_packet).unwrap();
 
-            println!("can_recv()");
-
             if let NdiscRepr::RouterAdvert { prefix_infos, router_lifetime, .. } = x {
                 println!("RA received.");
 
