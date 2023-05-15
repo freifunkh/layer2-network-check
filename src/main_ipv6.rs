@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress, NdiscPrefixInformation, Icmpv6Repr};
 use smoltcp::{
@@ -175,16 +174,6 @@ fn main() {
     };
     config.random_seed = rand::random();
     let mut iface: Interface = Interface::new(config, &mut device);
-
-    // Create sockets
-    let mut dhcp_socket = dhcpv4::Socket::new();
-    //dhcp_socket.set_ports(67, 68);
-
-    // Set a ridiculously short max lease time to show DHCP renews work properly.
-    // This will cause the DHCP client to start renewing after 5 seconds, and give up the
-    // lease after 10 seconds if renew hasn't succeeded.
-    // IMPORTANT: This should be removed in production.
-    dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(100)));
 
     let mut sockets = SocketSet::new(vec![]);
     let ll_prefix = &IPV6_PREFIX_LINK_LOCAL_UNICAST;
