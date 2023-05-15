@@ -258,6 +258,11 @@ fn main() {
             if let NdiscRepr::RouterAdvert { prefix_infos, router_lifetime, .. } = x {
                 println!("RA received.");
 
+                if remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != remote_addr {
+                    println!("Wrong source address. Ignoring.");
+                    continue;
+                }
+
                 if router_lifetime.secs() == 0 {
                     println!("No default router.");
                 }
