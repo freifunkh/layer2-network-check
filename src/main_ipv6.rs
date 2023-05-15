@@ -445,7 +445,7 @@ fn main() {
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
-    iface.update_ip_addrs(|addrs| {
+    iface.update_ip_addrs_without_flushing_cache(|addrs| {
         if cidr.address() == Ipv6Address::UNSPECIFIED {
             return;
         }
@@ -459,5 +459,6 @@ fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
             .push(IpCidr::Ipv6(cidr))
             .unwrap();
         println!("configured IP {}....", cidr);
+
     });
 }
