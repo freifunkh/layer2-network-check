@@ -195,9 +195,11 @@ fn main() {
 
     let mut send_at = Instant::from_millis(0);
 
-    let mut sent = false;
     let mut selected_ip : Option<Ipv6Cidr> = None;
     let mut selected_router : Option<Ipv6Address> = None;
+
+    let mut ra_remaining_attempts = 3;
+    let ra_timeout = Duration::from_secs(1);
 
     loop {
         let timestamp = Instant::now();
@@ -214,7 +216,13 @@ fn main() {
             send_at = timestamp;
         }
 
-        if !sent && socket.can_send() && send_at <= timestamp {
+        if socket.can_send() && send_at <= timestamp {
+
+            if ra_remaining_attempts < 1 {
+                break;
+            }
+
+            ra_remaining_attempts -= 1;
 
             let icmp_repr = NdiscRepr::RouterSolicit {
                 lladdr: Some(mac.into())
@@ -225,9 +233,10 @@ fn main() {
             let mut icmp_packet = Icmpv6Packet::new_unchecked(icmp_payload);
 
             icmp_repr.emit(&mut icmp_packet);
-            sent = true;
 
             println!("Sent RS to {}", remote_addr);
+
+            send_at = Instant::now() + ra_timeout;
         }
 
         if socket.can_recv() {
@@ -278,32 +287,7 @@ fn main() {
                     }
                 }
             }
-
-
-            // let icmp_packet = Icmpv4Packet::new_checked(&payload).unwrap();
-            // let icmp_repr = Icmpv4Repr::parse(&icmp_packet, &device_caps.checksum).unwrap();
-            // get_icmp_pong!(
-            //     Icmpv4Repr,
-            //     icmp_repr,
-            //     payload,
-            //     waiting_queue,
-            //     remote_addr,
-            //     timestamp,
-            //     received
-            // );
         }
-
-        // let timestamp = Instant::now();
-        // match iface.poll_at(timestamp, &sockets) {
-        //     Some(poll_at) if timestamp < poll_at => {
-        //         let resume_at = cmp::min(poll_at, send_at);
-        //         phy_wait(fd, Some(resume_at - timestamp)).expect("wait error");
-        //     }
-        //     Some(_) => (),
-        //     None => {
-        //         phy_wait(fd, Some(send_at - timestamp)).expect("wait error");
-        //     }
-        // }
 
         if selected_ip.is_some() {
             break;
@@ -313,6 +297,11 @@ fn main() {
     }
 
     sockets.remove(icmp_handle);
+
+    if selected_ip.is_none() {
+        println!("Did not obtain a public ip via RA.");
+        std::process::exit(1);
+    }
 
     println!("Assigned IP: {}", selected_ip.unwrap());
     println!("Assigned Router: {}", selected_router.unwrap());
@@ -430,6 +419,8 @@ fn main() {
         received,
         100.0 * (seq_no - received) as f64 / seq_no as f64
     );
+
+    // TODO: return code should depend on ping results?
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
