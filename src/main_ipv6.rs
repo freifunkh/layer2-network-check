@@ -116,6 +116,12 @@ fn main() {
         "mac to use for the raw socket",
         "MAC"
     );
+    opts.optopt(
+        "",
+        "allowed-drops",
+        "number of icmp ping packets that can be lost while the return code is still ok. (Default: 1)",
+        "NUM"
+    );
 
     #[cfg(feature = "log")] {
         opts.optflag(
@@ -140,6 +146,10 @@ fn main() {
     let iface_name = args
         .opt_str("interface")
         .unwrap_or("wlp3s0".into());
+    let ping_allowed_drops = args
+        .opt_str("allowed-drops")
+        .map(|s| s.parse().unwrap() )
+        .unwrap_or(1);
 
     let mut matches = utils::parse_options(&opts, free);
     //let device = utils::parse_tuntap_options(&mut matches);
@@ -420,7 +430,9 @@ fn main() {
         100.0 * (seq_no - received) as f64 / seq_no as f64
     );
 
-    // TODO: return code should depend on ping results?
+    if seq_no - received > ping_allowed_drops {
+        std::process::exit(1);
+    }
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
