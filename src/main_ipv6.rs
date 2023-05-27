@@ -109,6 +109,44 @@ pub fn emit_ipv6_rs(socket: &mut Socket, remote_addr: &Ipv6Address, source_mac: 
     icmp_repr.emit(&mut icmp_packet);
 }
 
+pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress) -> Option<Ipv6Cidr> {
+    let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
+    let x = NdiscRepr::parse(&icmp_packet).unwrap();
+
+    if let NdiscRepr::RouterAdvert { prefix_infos, router_lifetime, .. } = x {
+        println!("RA received.");
+
+        if router_lifetime.secs() == 0 {
+            println!("No default router.");
+            return None;
+        }
+
+        println!("Router lifetime: {}", router_lifetime.secs());
+
+        for i in 0..8 {
+            if let Some(NdiscPrefixInformation { prefix, prefix_len, .. }) = prefix_infos[i] {
+                println!("Prefix: {}/{}", prefix, prefix_len);
+
+                let ip6 = ipv6_from_prefix(&prefix, &mac);
+                println!("IP: {}", ip6);
+
+                println!("Is global? {}", ipv6_is_global(&ip6));
+
+                if prefix_len != 64 {
+                    println!("Prefix length must be 64.");
+                    continue;
+                }
+
+                if ipv6_is_global(&ip6) {
+                    return Some(Ipv6Cidr::new(ip6, prefix_len));
+                }
+            }
+        }
+    }
+
+    return None;
+}
+
 fn main() {
 
     let (mut opts, mut free) = utils::create_options();
@@ -267,48 +305,15 @@ fn main() {
                 }
             };
 
-            let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
-            let x = NdiscRepr::parse(&icmp_packet).unwrap();
-
-            if let NdiscRepr::RouterAdvert { prefix_infos, router_lifetime, .. } = x {
-                println!("RA received.");
-
-                if remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != remote_addr {
-                    println!("Wrong source address. Ignoring.");
-                    continue;
-                }
-
-                if router_lifetime.secs() == 0 {
-                    println!("No default router.");
-                    continue;
-                }
-
-                println!("Router lifetime: {}", router_lifetime.secs());
-
-                for i in 0..8 {
-                    if let Some(NdiscPrefixInformation { prefix, prefix_len, .. }) = prefix_infos[i] {
-                        println!("Prefix: {}/{}", prefix, prefix_len);
-
-                        let ip6 = ipv6_from_prefix(&prefix, &mac);
-                        println!("IP: {}", ip6);
-
-                        println!("Is global? {}", ipv6_is_global(&ip6));
-
-                        if prefix_len != 64 {
-                            println!("Prefix length must be 64.");
-                        }
-
-                        if ipv6_is_global(&ip6) {
-                            selected_ip = Some(Ipv6Cidr::new(ip6, prefix_len));
-                            selected_router = Some(ip6_source_addr);
-                        }
-                    }
-                }
+            if remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != remote_addr {
+                println!("Wrong source address. Ignoring.");
+                continue;
             }
-        }
 
-        if selected_ip.is_some() {
-            break;
+            selected_ip = parse_ipv6_ra_get_public_ipv6(&payload, &mac);
+            if selected_ip.is_some() {
+                selected_router = Some(ip6_source_addr);
+            }
         }
 
         phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
