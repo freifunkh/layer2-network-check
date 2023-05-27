@@ -147,6 +147,88 @@ pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress) -> O
     return None;
 }
 
+pub fn obtain_public_ip6_via_ra<D>(sockets: &mut SocketSet,
+    device: &mut D, iface: &mut Interface,
+    remote_addr: &Ipv6Address, fd: i32, mac: & EthernetAddress)
+        -> Option<(Ipv6Cidr, Ipv6Address)>
+where
+    D: Device
+{
+    // Create sockets
+    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
+    let icmp_handle = sockets.add(icmp_socket);
+
+    let mut send_at = Instant::from_millis(0);
+
+    let mut selected_ip : Option<Ipv6Cidr> = None;
+    let mut selected_router : Option<Ipv6Address> = None;
+
+    let mut ra_remaining_attempts = 3;
+    let ra_timeout = Duration::from_secs(1);
+
+    loop {
+        let timestamp = Instant::now();
+        iface.poll(timestamp, device, sockets);
+
+        let timestamp = Instant::now();
+        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
+        if !socket.is_open() {
+            socket.bind(icmp::Endpoint::IPv6Ndisc).unwrap();
+            socket.set_hop_limit(Some(255));
+            send_at = timestamp;
+        }
+
+        if socket.can_send() && send_at <= timestamp {
+
+            if ra_remaining_attempts < 1 {
+                break;
+            }
+
+            ra_remaining_attempts -= 1;
+
+            emit_ipv6_rs(socket, &remote_addr, &mac);
+
+            println!("Sent RS to {}", remote_addr);
+
+            send_at = Instant::now() + ra_timeout;
+        }
+
+        if socket.can_recv() {
+            let (payload, source_addr) = socket.recv().unwrap();
+
+            let ip6_source_addr = match source_addr {
+                IpAddress::Ipv6(ip6) => ip6,
+                _ => {
+                    break;
+                }
+            };
+
+            if *remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != *remote_addr {
+                println!("Wrong source address. Ignoring.");
+                continue;
+            }
+
+            selected_ip = parse_ipv6_ra_get_public_ipv6(&payload, &mac);
+            if selected_ip.is_some() {
+                selected_router = Some(ip6_source_addr);
+                break;
+            }
+        }
+
+        phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+    }
+
+    sockets.remove(icmp_handle);
+
+    if selected_ip.is_some() {
+        return Some((selected_ip.unwrap(), selected_router.unwrap()));
+    }
+
+    None
+}
+
 fn main() {
 
     let (mut opts, mut free) = utils::create_options();
@@ -206,7 +288,6 @@ fn main() {
         .unwrap_or(1);
 
     let mut matches = utils::parse_options(&opts, free);
-    //let device = utils::parse_tuntap_options(&mut matches);
     let device = RawSocket::new(&iface_name, Medium::Ethernet).unwrap();
 
     let fd = device.as_raw_fd();
@@ -251,87 +332,28 @@ fn main() {
     });
     println!("Assigned IP: {}", ll_addr);
 
-    // Create sockets
-    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    let icmp_handle = sockets.add(icmp_socket);
+    let ra_result = obtain_public_ip6_via_ra(
+        &mut sockets,
+        &mut device,
+        &mut iface,
+        &remote_addr,
+        fd,
+        &mac
+    );
 
-    let mut send_at = Instant::from_millis(0);
-
-    let mut selected_ip : Option<Ipv6Cidr> = None;
-    let mut selected_router : Option<Ipv6Address> = None;
-
-    let mut ra_remaining_attempts = 3;
-    let ra_timeout = Duration::from_secs(1);
-
-    loop {
-        let timestamp = Instant::now();
-        iface.poll(timestamp, &mut device, &mut sockets);
-
-        let timestamp = Instant::now();
-        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
-        if !socket.is_open() {
-            // socket.bind(icmp::Endpoint::Ident(ident)).unwrap();
-            //socket.bind(icmp::Endpoint::Unspecified).unwrap();
-            socket.bind(icmp::Endpoint::IPv6Ndisc).unwrap();
-            // router solicitations must be sent with hop_limit = 255
-            socket.set_hop_limit(Some(255));
-            send_at = timestamp;
-        }
-
-        if socket.can_send() && send_at <= timestamp {
-
-            if ra_remaining_attempts < 1 {
-                break;
-            }
-
-            ra_remaining_attempts -= 1;
-
-            emit_ipv6_rs(socket, &remote_addr, &mac);
-
-            println!("Sent RS to {}", remote_addr);
-
-            send_at = Instant::now() + ra_timeout;
-        }
-
-        if socket.can_recv() {
-            let (payload, source_addr) = socket.recv().unwrap();
-
-            let ip6_source_addr = match source_addr {
-                IpAddress::Ipv6(ip6) => ip6,
-                _ => {
-                    break;
-                }
-            };
-
-            if remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != remote_addr {
-                println!("Wrong source address. Ignoring.");
-                continue;
-            }
-
-            selected_ip = parse_ipv6_ra_get_public_ipv6(&payload, &mac);
-            if selected_ip.is_some() {
-                selected_router = Some(ip6_source_addr);
-            }
-        }
-
-        phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
-    }
-
-    sockets.remove(icmp_handle);
-
-    if selected_ip.is_none() {
+    if ra_result.is_none() {
         println!("Did not obtain a public ip via RA.");
         std::process::exit(1);
     }
 
-    println!("Assigned IP: {}", selected_ip.unwrap());
-    println!("Assigned Router: {}", selected_router.unwrap());
+    let (selected_ip, selected_router) = ra_result.unwrap();
 
-    set_ipv6_addr(&mut iface, selected_ip.unwrap());
+    println!("Assigned IP: {}", selected_ip);
+    println!("Assigned Router: {}", selected_router);
 
-    iface.routes_mut().add_default_ipv6_route(selected_router.unwrap()).unwrap();
+    set_ipv6_addr(&mut iface, selected_ip);
+
+    iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
 
     // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
