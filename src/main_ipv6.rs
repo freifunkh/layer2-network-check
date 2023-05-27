@@ -7,12 +7,13 @@ use std::os::unix::io::AsRawFd;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress, NdiscPrefixInformation, Icmpv6Repr};
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress,
+    NdiscPrefixInformation, Icmpv6Repr, RawHardwareAddress};
 use smoltcp::{
     phy::{wait as phy_wait, Device, Medium, RawSocket},
     time::Duration,
 };
-use smoltcp::socket::icmp;
+use smoltcp::socket::icmp::{self, Socket};
 
 use smoltcp::wire::{
     Icmpv6Packet, NdiscRepr, Ipv6Cidr
@@ -91,6 +92,21 @@ pub fn ipv6_is_global(ip: &Ipv6Address) -> bool {
     let bytes = ip.as_bytes();
 
     bytes[0] & 0xe0 == 0x20
+}
+
+pub fn emit_ipv6_rs(socket: &mut Socket, remote_addr: &Ipv6Address, source_mac: &EthernetAddress) {
+
+    let icmp_repr = NdiscRepr::RouterSolicit {
+        lladdr: Some(RawHardwareAddress::from(*source_mac))
+    };
+
+    let icmp_payload = socket.send(
+        icmp_repr.buffer_len(),
+        remote_addr.into_address()).unwrap();
+
+    let mut icmp_packet = Icmpv6Packet::new_unchecked(icmp_payload);
+
+    icmp_repr.emit(&mut icmp_packet);
 }
 
 fn main() {
@@ -234,15 +250,7 @@ fn main() {
 
             ra_remaining_attempts -= 1;
 
-            let icmp_repr = NdiscRepr::RouterSolicit {
-                lladdr: Some(mac.into())
-            };
-    
-            let icmp_payload = socket.send(icmp_repr.buffer_len(), remote_addr.into_address()).unwrap();
-    
-            let mut icmp_packet = Icmpv6Packet::new_unchecked(icmp_payload);
-
-            icmp_repr.emit(&mut icmp_packet);
+            emit_ipv6_rs(socket, &remote_addr, &mac);
 
             println!("Sent RS to {}", remote_addr);
 
