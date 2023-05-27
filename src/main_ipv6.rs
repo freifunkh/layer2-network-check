@@ -229,6 +229,124 @@ where
     None
 }
 
+
+pub fn ping6<D>(sockets: &mut SocketSet,
+    device: &mut D, iface: &mut Interface,
+    remote_addr: &Ipv6Address, fd: i32, num_pings: u16)
+        -> u16
+where
+    D: Device
+{
+    // Create sockets
+    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
+    let icmp_handle = sockets.add(icmp_socket);
+
+    let mut send_at = Instant::from_millis(0);
+    let mut seq_no = 0;
+    let mut received = 0;
+    let mut echo_payload = [0xffu8; 40];
+    let mut waiting_queue = HashMap::new();
+    let ident = 0x22b;
+
+    let timeout = Duration::from_secs(1);
+    let interval = Duration::from_secs(1);
+    let device_caps = device.capabilities();
+
+    loop {
+        let timestamp = Instant::now();
+        iface.poll(timestamp, device, sockets);
+
+        let timestamp = Instant::now();
+        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
+        if !socket.is_open() {
+            socket.bind(icmp::Endpoint::Ident(ident)).unwrap();
+            send_at = timestamp;
+        }
+
+        if socket.can_send() && seq_no < num_pings as u16 && send_at <= timestamp {
+            NetworkEndian::write_i64(&mut echo_payload, timestamp.total_millis());
+
+            let (icmp_repr, mut icmp_packet) = send_icmp_ping!(
+                Icmpv6Repr,
+                Icmpv6Packet,
+                ident,
+                seq_no,
+                echo_payload,
+                socket,
+                remote_addr.into_address()
+            );
+            icmp_repr.emit(
+                &iface.ipv6_addr().unwrap().into_address(),
+                &remote_addr.into_address(),
+                &mut icmp_packet,
+                &device_caps.checksum,
+            );
+
+            waiting_queue.insert(seq_no, timestamp);
+            seq_no += 1;
+            send_at += interval;
+        }
+
+        if socket.can_recv() {
+            let (payload, _) = socket.recv().unwrap();
+
+            let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
+            let icmp_repr = Icmpv6Repr::parse(
+                &remote_addr.into_address(),
+                &iface.ipv6_addr().unwrap().into_address(),
+                &icmp_packet,
+                &device_caps.checksum,
+            ).unwrap();
+            get_icmp_pong!(
+                Icmpv6Repr,
+                icmp_repr,
+                payload,
+                waiting_queue,
+                remote_addr,
+                timestamp,
+                received
+            );
+        }
+
+        waiting_queue.retain(|seq, from| {
+            if timestamp - *from < timeout {
+                true
+            } else {
+                println!("From {remote_addr} icmp_seq={seq} timeout");
+                false
+            }
+        });
+
+        if seq_no == num_pings as u16 && waiting_queue.is_empty() {
+            break;
+        }
+
+        let timestamp = Instant::now();
+        match iface.poll_at(timestamp, &sockets) {
+            Some(poll_at) if timestamp < poll_at => {
+                let resume_at = cmp::min(poll_at, send_at);
+                phy_wait(fd, Some(resume_at - timestamp)).expect("wait error");
+            }
+            Some(_) => (),
+            None => {
+                phy_wait(fd, Some(send_at - timestamp)).expect("wait error");
+            }
+        }
+    }
+
+    println!("--- {remote_addr} ping statistics ---");
+    println!(
+        "{} packets transmitted, {} received, {:.0}% packet loss",
+        seq_no,
+        received,
+        100.0 * (seq_no - received) as f64 / seq_no as f64
+    );
+
+    return received
+}
+
 fn main() {
 
     let (mut opts, mut free) = utils::create_options();
@@ -355,117 +473,19 @@ fn main() {
 
     iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
 
-    // Create sockets
-    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    let icmp_handle = sockets.add(icmp_socket);
+    let remote_addr = Ipv6Address(
+        [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
+    let num_pings = 4;
 
-    let mut send_at = Instant::from_millis(0);
-    let mut seq_no = 0;
-    let mut received = 0;
-    let mut echo_payload = [0xffu8; 40];
-    let mut waiting_queue = HashMap::new();
-    let ident = 0x22b;
+    let received = ping6(
+        &mut sockets,
+        &mut device,
+        &mut iface,
+        &remote_addr,
+        fd,
+        num_pings);
 
-    let remote_addr = IpAddress::v6(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844); // from("2001:4860:4860:0:0:0:0:8844");
-
-    let count = 4;
-    let timeout = Duration::from_secs(1);
-    let interval = Duration::from_secs(1);
-    let device_caps = device.capabilities();
-
-    loop {
-        let timestamp = Instant::now();
-        iface.poll(timestamp, &mut device, &mut sockets);
-
-        let timestamp = Instant::now();
-        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
-        if !socket.is_open() {
-            socket.bind(icmp::Endpoint::Ident(ident)).unwrap();
-            send_at = timestamp;
-        }
-
-        if socket.can_send() && seq_no < count as u16 && send_at <= timestamp {
-            NetworkEndian::write_i64(&mut echo_payload, timestamp.total_millis());
-
-            let (icmp_repr, mut icmp_packet) = send_icmp_ping!(
-                Icmpv6Repr,
-                Icmpv6Packet,
-                ident,
-                seq_no,
-                echo_payload,
-                socket,
-                remote_addr
-            );
-            icmp_repr.emit(
-                &iface.ipv6_addr().unwrap().into_address(),
-                &remote_addr,
-                &mut icmp_packet,
-                &device_caps.checksum,
-            );
-
-            waiting_queue.insert(seq_no, timestamp);
-            seq_no += 1;
-            send_at += interval;
-        }
-
-        if socket.can_recv() {
-            let (payload, _) = socket.recv().unwrap();
-
-            let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
-            let icmp_repr = Icmpv6Repr::parse(
-                &remote_addr,
-                &iface.ipv6_addr().unwrap().into_address(),
-                &icmp_packet,
-                &device_caps.checksum,
-            ).unwrap();
-            get_icmp_pong!(
-                Icmpv6Repr,
-                icmp_repr,
-                payload,
-                waiting_queue,
-                remote_addr,
-                timestamp,
-                received
-            );
-        }
-
-        waiting_queue.retain(|seq, from| {
-            if timestamp - *from < timeout {
-                true
-            } else {
-                println!("From {remote_addr} icmp_seq={seq} timeout");
-                false
-            }
-        });
-
-        if seq_no == count as u16 && waiting_queue.is_empty() {
-            break;
-        }
-
-        let timestamp = Instant::now();
-        match iface.poll_at(timestamp, &sockets) {
-            Some(poll_at) if timestamp < poll_at => {
-                let resume_at = cmp::min(poll_at, send_at);
-                phy_wait(fd, Some(resume_at - timestamp)).expect("wait error");
-            }
-            Some(_) => (),
-            None => {
-                phy_wait(fd, Some(send_at - timestamp)).expect("wait error");
-            }
-        }
-    }
-
-    println!("--- {remote_addr} ping statistics ---");
-    println!(
-        "{} packets transmitted, {} received, {:.0}% packet loss",
-        seq_no,
-        received,
-        100.0 * (seq_no - received) as f64 / seq_no as f64
-    );
-
-    if seq_no - received > ping_allowed_drops {
+    if num_pings - received > ping_allowed_drops {
         std::process::exit(1);
     }
 }
