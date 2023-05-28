@@ -147,9 +147,15 @@ pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress) -> O
     return None;
 }
 
-pub fn obtain_public_ip6_via_ra<D>(sockets: &mut SocketSet,
-    device: &mut D, iface: &mut Interface,
-    remote_addr: &Ipv6Address, fd: i32, mac: & EthernetAddress)
+struct NetworkState<'a, D : Device> {
+    sockets: &'a mut SocketSet<'a>,
+    device: &'a mut D,
+    iface: &'a mut Interface,
+    fd: i32
+}
+
+fn obtain_public_ip6_via_ra<D>(network_state: &mut NetworkState<D>,
+    remote_addr: &Ipv6Address, mac: & EthernetAddress)
         -> Option<(Ipv6Cidr, Ipv6Address)>
 where
     D: Device
@@ -158,7 +164,7 @@ where
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    let icmp_handle = sockets.add(icmp_socket);
+    let icmp_handle = network_state.sockets.add(icmp_socket);
 
     let mut send_at = Instant::from_millis(0);
 
@@ -170,10 +176,10 @@ where
 
     loop {
         let timestamp = Instant::now();
-        iface.poll(timestamp, device, sockets);
+        network_state.iface.poll(timestamp, network_state.device, network_state.sockets);
 
         let timestamp = Instant::now();
-        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
+        let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
         if !socket.is_open() {
             socket.bind(icmp::Endpoint::IPv6Ndisc).unwrap();
             socket.set_hop_limit(Some(255));
@@ -217,10 +223,10 @@ where
             }
         }
 
-        phy_wait(fd, iface.poll_delay(timestamp, &sockets)).expect("wait error");
+        phy_wait(network_state.fd, network_state.iface.poll_delay(timestamp, &network_state.sockets)).expect("wait error");
     }
 
-    sockets.remove(icmp_handle);
+    network_state.sockets.remove(icmp_handle);
 
     if selected_ip.is_some() {
         return Some((selected_ip.unwrap(), selected_router.unwrap()));
@@ -230,9 +236,8 @@ where
 }
 
 
-pub fn ping6<D>(sockets: &mut SocketSet,
-    device: &mut D, iface: &mut Interface,
-    remote_addr: &Ipv6Address, fd: i32, num_pings: u16)
+fn ping6<D>(network_state: &mut NetworkState<D>,
+    remote_addr: &Ipv6Address, num_pings: u16)
         -> u16
 where
     D: Device
@@ -241,7 +246,7 @@ where
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
     let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    let icmp_handle = sockets.add(icmp_socket);
+    let icmp_handle = network_state.sockets.add(icmp_socket);
 
     let mut send_at = Instant::from_millis(0);
     let mut seq_no = 0;
@@ -252,14 +257,14 @@ where
 
     let timeout = Duration::from_secs(1);
     let interval = Duration::from_secs(1);
-    let device_caps = device.capabilities();
+    let device_caps = network_state.device.capabilities();
 
     loop {
         let timestamp = Instant::now();
-        iface.poll(timestamp, device, sockets);
+        network_state.iface.poll(timestamp, network_state.device, network_state.sockets);
 
         let timestamp = Instant::now();
-        let socket = sockets.get_mut::<icmp::Socket>(icmp_handle);
+        let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
         if !socket.is_open() {
             socket.bind(icmp::Endpoint::Ident(ident)).unwrap();
             send_at = timestamp;
@@ -278,7 +283,7 @@ where
                 remote_addr.into_address()
             );
             icmp_repr.emit(
-                &iface.ipv6_addr().unwrap().into_address(),
+                &network_state.iface.ipv6_addr().unwrap().into_address(),
                 &remote_addr.into_address(),
                 &mut icmp_packet,
                 &device_caps.checksum,
@@ -295,7 +300,7 @@ where
             let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
             let icmp_repr = Icmpv6Repr::parse(
                 &remote_addr.into_address(),
-                &iface.ipv6_addr().unwrap().into_address(),
+                &network_state.iface.ipv6_addr().unwrap().into_address(),
                 &icmp_packet,
                 &device_caps.checksum,
             ).unwrap();
@@ -324,14 +329,14 @@ where
         }
 
         let timestamp = Instant::now();
-        match iface.poll_at(timestamp, &sockets) {
+        match network_state.iface.poll_at(timestamp, &network_state.sockets) {
             Some(poll_at) if timestamp < poll_at => {
                 let resume_at = cmp::min(poll_at, send_at);
-                phy_wait(fd, Some(resume_at - timestamp)).expect("wait error");
+                phy_wait(network_state.fd, Some(resume_at - timestamp)).expect("wait error");
             }
             Some(_) => (),
             None => {
-                phy_wait(fd, Some(send_at - timestamp)).expect("wait error");
+                phy_wait(network_state.fd, Some(send_at - timestamp)).expect("wait error");
             }
         }
     }
@@ -450,12 +455,16 @@ fn main() {
     });
     println!("Assigned IP: {}", ll_addr);
 
+    let mut network_state = NetworkState {
+        sockets: &mut sockets,
+        device: &mut device,
+        iface: &mut iface,
+        fd: fd
+    };
+
     let ra_result = obtain_public_ip6_via_ra(
-        &mut sockets,
-        &mut device,
-        &mut iface,
+        &mut network_state,
         &remote_addr,
-        fd,
         &mac
     );
 
@@ -469,20 +478,17 @@ fn main() {
     println!("Assigned IP: {}", selected_ip);
     println!("Assigned Router: {}", selected_router);
 
-    set_ipv6_addr(&mut iface, selected_ip);
+    set_ipv6_addr(network_state.iface, selected_ip);
 
-    iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
+    network_state.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
 
     let remote_addr = Ipv6Address(
         [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
     let num_pings = 4;
 
     let received = ping6(
-        &mut sockets,
-        &mut device,
-        &mut iface,
+        &mut network_state,
         &remote_addr,
-        fd,
         num_pings);
 
     if num_pings - received > ping_allowed_drops {
