@@ -45,17 +45,19 @@ macro_rules! send_icmp_ping {
 
 macro_rules! get_icmp_pong {
     ( $repr_type:ident, $repr:expr, $payload:expr, $waiting_queue:expr, $remote_addr:expr,
-      $timestamp:expr, $received:expr ) => {{
+      $timestamp:expr, $received:expr, $verbose:expr ) => {{
         if let $repr_type::EchoReply { seq_no, data, .. } = $repr {
             if let Some(_) = $waiting_queue.get(&seq_no) {
                 let packet_timestamp_ms = NetworkEndian::read_i64(data);
-                println!(
-                    "{} bytes from {}: icmp_seq={}, time={}ms",
-                    data.len(),
-                    $remote_addr,
-                    seq_no,
-                    $timestamp.total_millis() - packet_timestamp_ms
-                );
+                if $verbose {
+                    println!(
+                        "{} bytes from {}: icmp_seq={}, time={}ms",
+                        data.len(),
+                        $remote_addr,
+                        seq_no,
+                        $timestamp.total_millis() - packet_timestamp_ms
+                    );
+                }
                 $waiting_queue.remove(&seq_no);
                 $received += 1;
             }
@@ -109,31 +111,42 @@ pub fn emit_ipv6_rs(socket: &mut Socket, remote_addr: &Ipv6Address, source_mac: 
     icmp_repr.emit(&mut icmp_packet);
 }
 
-pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress) -> Option<Ipv6Cidr> {
+pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress, verbose: bool) -> Option<Ipv6Cidr> {
     let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
     let x = NdiscRepr::parse(&icmp_packet).unwrap();
 
     if let NdiscRepr::RouterAdvert { prefix_infos, router_lifetime, .. } = x {
-        println!("RA received.");
+        if verbose {
+            println!("RA received.");
+        }
 
         if router_lifetime.secs() == 0 {
-            println!("No default router.");
+            if verbose {
+                println!("No default router.");
+            }
             return None;
         }
 
-        println!("Router lifetime: {}", router_lifetime.secs());
+        if verbose {
+            println!("Router lifetime: {}", router_lifetime.secs());
+        }
 
         for i in 0..8 {
             if let Some(NdiscPrefixInformation { prefix, prefix_len, .. }) = prefix_infos[i] {
-                println!("Prefix: {}/{}", prefix, prefix_len);
+                if verbose {
+                    println!("Prefix: {}/{}", prefix, prefix_len);
+                }
 
                 let ip6 = ipv6_from_prefix(&prefix, &mac);
-                println!("IP: {}", ip6);
-
-                println!("Is global? {}", ipv6_is_global(&ip6));
+                if verbose {
+                    println!("IP: {}", ip6);
+                    println!("Is global? {}", ipv6_is_global(&ip6));
+                }
 
                 if prefix_len != 64 {
-                    println!("Prefix length must be 64.");
+                    if verbose {
+                        println!("Prefix length must be 64.");
+                    }
                     continue;
                 }
 
@@ -155,7 +168,7 @@ struct NetworkState<'a, D : Device> {
 }
 
 fn obtain_public_ip6_via_ra<D>(network_state: &mut NetworkState<D>,
-    remote_addr: &Ipv6Address, mac: & EthernetAddress)
+    remote_addr: &Ipv6Address, mac: & EthernetAddress, verbose: bool)
         -> Option<(Ipv6Cidr, Ipv6Address)>
 where
     D: Device
@@ -196,7 +209,9 @@ where
 
             emit_ipv6_rs(socket, &remote_addr, &mac);
 
-            println!("Sent RS to {}", remote_addr);
+            if verbose {
+                println!("Sent RS to {}", remote_addr);
+            }
 
             send_at = Instant::now() + ra_timeout;
         }
@@ -212,11 +227,13 @@ where
             };
 
             if *remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != *remote_addr {
-                println!("Wrong source address. Ignoring.");
+                if verbose {
+                    println!("Wrong source address. Ignoring.");
+                }
                 continue;
             }
 
-            selected_ip = parse_ipv6_ra_get_public_ipv6(&payload, &mac);
+            selected_ip = parse_ipv6_ra_get_public_ipv6(&payload, &mac, verbose);
             if selected_ip.is_some() {
                 selected_router = Some(ip6_source_addr);
                 break;
@@ -237,7 +254,7 @@ where
 
 
 fn ping6<D>(network_state: &mut NetworkState<D>,
-    remote_addr: &Ipv6Address, num_pings: u16)
+    remote_addr: &Ipv6Address, num_pings: u16, verbose: bool)
         -> u16
 where
     D: Device
@@ -311,7 +328,8 @@ where
                 waiting_queue,
                 remote_addr,
                 timestamp,
-                received
+                received,
+                verbose
             );
         }
 
@@ -319,7 +337,9 @@ where
             if timestamp - *from < timeout {
                 true
             } else {
-                println!("From {remote_addr} icmp_seq={seq} timeout");
+                if verbose {
+                    println!("From {remote_addr} icmp_seq={seq} timeout");
+                }
                 false
             }
         });
@@ -341,13 +361,15 @@ where
         }
     }
 
-    println!("--- {remote_addr} ping statistics ---");
-    println!(
-        "{} packets transmitted, {} received, {:.0}% packet loss",
-        seq_no,
-        received,
-        100.0 * (seq_no - received) as f64 / seq_no as f64
-    );
+    if verbose {
+        println!("--- {remote_addr} ping statistics ---");
+        println!(
+            "{} packets transmitted, {} received, {:.0}% packet loss",
+            seq_no,
+            received,
+            100.0 * (seq_no - received) as f64 / seq_no as f64
+        );
+    }
 
     return received
 }
@@ -381,6 +403,11 @@ fn main() {
         "number of icmp ping packets that can be lost while the return code is still ok. (Default: 1)",
         "NUM"
     );
+    opts.optflag(
+        "v",
+        "verbose",
+        "show verbose information"
+    );
 
     #[cfg(feature = "log")] {
         opts.optflag(
@@ -409,6 +436,7 @@ fn main() {
         .opt_str("allowed-drops")
         .map(|s| s.parse().unwrap() )
         .unwrap_or(1);
+    let verbose = args.opt_present("verbose");
 
     let mut matches = utils::parse_options(&opts, free);
     let device = RawSocket::new(&iface_name, Medium::Ethernet).unwrap();
@@ -429,7 +457,9 @@ fn main() {
     };
 
     let mac = EthernetAddress::from_str(mac_str.as_str()).unwrap();
-    println!("Using MAC: {}.", mac_str);
+    if verbose {
+        println!("Using MAC: {}.", mac_str);
+    }
 
     // Create interface
     let mut config = match device.capabilities().medium {
@@ -453,7 +483,9 @@ fn main() {
             .push(ll_addr.clone())
             .unwrap();
     });
-    println!("Assigned IP: {}", ll_addr);
+    if verbose {
+        println!("Assigned IP: {}", ll_addr);
+    }
 
     let mut network_state = NetworkState {
         sockets: &mut sockets,
@@ -465,20 +497,25 @@ fn main() {
     let ra_result = obtain_public_ip6_via_ra(
         &mut network_state,
         &remote_addr,
-        &mac
+        &mac,
+        verbose
     );
 
     if ra_result.is_none() {
-        println!("Did not obtain a public ip via RA.");
+        if verbose {
+            println!("Did not obtain a public ip via RA.");
+        }
         std::process::exit(1);
     }
 
     let (selected_ip, selected_router) = ra_result.unwrap();
 
-    println!("Assigned IP: {}", selected_ip);
-    println!("Assigned Router: {}", selected_router);
+    if verbose {
+        println!("Assigned IP: {}", selected_ip);
+        println!("Assigned Router: {}", selected_router);
+    }
 
-    set_ipv6_addr(network_state.iface, selected_ip);
+    set_ipv6_addr(network_state.iface, selected_ip, verbose);
 
     network_state.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
 
@@ -489,14 +526,15 @@ fn main() {
     let received = ping6(
         &mut network_state,
         &remote_addr,
-        num_pings);
+        num_pings,
+        verbose);
 
     if num_pings - received > ping_allowed_drops {
         std::process::exit(1);
     }
 }
 
-fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
+fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr, verbose: bool) {
     iface.update_ip_addrs_without_flushing_cache(|addrs| {
         if cidr.address() == Ipv6Address::UNSPECIFIED {
             return;
@@ -504,13 +542,16 @@ fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr) {
 
         let old_addr = addrs.pop();
         if let Some(addr) = old_addr {
-            println!("deconfigured IP {}", addr);
+            if verbose {
+                println!("deconfigured IP {}", addr);
+            }
         }
 
         addrs
             .push(IpCidr::Ipv6(cidr))
             .unwrap();
-        println!("configured IP {}....", cidr);
-
+        if verbose {
+            println!("configured IP {}....", cidr);
+        }
     });
 }
