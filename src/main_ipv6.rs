@@ -374,6 +374,11 @@ where
     return received
 }
 
+fn print_json_result(address_obtained: bool, pings_sent: u16, pings_answered: u16) {
+    println!("{{ \"address_obtained\": {}, \"echo requests\": {{ \"sent\": {}, \"answered\": {} }} }}",
+        address_obtained as i32, pings_sent, pings_answered);
+}
+
 fn main() {
 
     let (mut opts, mut free) = utils::create_options();
@@ -505,6 +510,7 @@ fn main() {
         if verbose {
             println!("Did not obtain a public ip via RA.");
         }
+        print_json_result(false, 0, 0);
         std::process::exit(1);
     }
 
@@ -528,6 +534,8 @@ fn main() {
         &remote_addr,
         num_pings,
         verbose);
+
+    print_json_result(true, num_pings, received);
 
     if num_pings - received > ping_allowed_drops {
         std::process::exit(1);
