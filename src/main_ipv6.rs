@@ -375,7 +375,7 @@ where
 }
 
 fn print_json_result(address_obtained: bool, pings_sent: u16, pings_answered: u16) {
-    println!("{{ \"address_obtained\": {}, \"echo requests\": {{ \"sent\": {}, \"answered\": {} }} }}",
+    println!("{{ \"address_obtained\": {}, \"echo_requests\": {{ \"sent\": {}, \"answered\": {} }} }}",
         address_obtained as i32, pings_sent, pings_answered);
 }
 
