@@ -27,6 +27,8 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+use rand::Rng;
+
 macro_rules! send_icmp_ping {
     ( $repr_type:ident, $packet_type:ident, $ident:expr, $seq_no:expr,
       $echo_payload:expr, $socket:expr, $remote_addr:expr ) => {{
@@ -270,7 +272,9 @@ where
     let mut received = 0;
     let mut echo_payload = [0xffu8; 40];
     let mut waiting_queue = HashMap::new();
-    let ident = 0x22b;
+
+    let mut rng = rand::thread_rng();
+    let ident: u16 = rng.gen();
 
     let timeout = Duration::from_secs(1);
     let interval = Duration::from_secs(1);
