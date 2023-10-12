@@ -5,6 +5,8 @@ use std::cmp;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 
+use std::cell::RefCell;
+
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress,
@@ -164,7 +166,7 @@ pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress, verb
 
 struct NetworkState<'a, D : Device> {
     sockets: &'a mut SocketSet<'a>,
-    device: &'a mut D,
+    device: &'a RefCell<D>,
     iface: &'a mut Interface,
     fd: i32
 }
@@ -191,7 +193,7 @@ where
 
     loop {
         let timestamp = Instant::now();
-        network_state.iface.poll(timestamp, network_state.device, network_state.sockets);
+        network_state.iface.poll(timestamp, &mut * network_state.device.borrow_mut(), network_state.sockets);
 
         let timestamp = Instant::now();
         let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -255,7 +257,7 @@ where
 }
 
 
-fn ping6<D>(network_state: &mut NetworkState<D>,
+fn ping6<D>(network_state: &NetworkState<D>,
     remote_addr: &Ipv6Address, num_pings: u16, verbose: bool)
         -> u16
 where
@@ -278,11 +280,11 @@ where
 
     let timeout = Duration::from_secs(1);
     let interval = Duration::from_secs(1);
-    let device_caps = network_state.device.capabilities();
+    let device_caps = network_state.device.borrow().capabilities();
 
     loop {
         let timestamp = Instant::now();
-        network_state.iface.poll(timestamp, network_state.device, network_state.sockets);
+        network_state.iface.poll(timestamp, &mut *network_state.device.borrow_mut(), network_state.sockets);
 
         let timestamp = Instant::now();
         let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -496,9 +498,11 @@ fn main() {
         println!("Assigned IP: {}", ll_addr);
     }
 
+    let device_refcell = RefCell::new(device);
+
     let mut network_state = NetworkState {
         sockets: &mut sockets,
-        device: &mut device,
+        device: &device_refcell,
         iface: &mut iface,
         fd: fd
     };
@@ -534,7 +538,11 @@ fn main() {
     let num_pings = 4;
 
     let received = ping6(
-        &mut network_state,
+        &network_state,
+        &remote_addr,
+        num_pings,
+        verbose);
+
         &remote_addr,
         num_pings,
         verbose);
