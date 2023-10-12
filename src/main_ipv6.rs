@@ -483,7 +483,19 @@ fn main() {
     config.random_seed = rand::random();
     let mut iface: Interface = Interface::new(config, &mut device);
 
+    let mut config2 = match device.capabilities().medium {
+        Medium::Ethernet => {
+            Config::new(mac.into()).into()
+        }
+        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+        Medium::Ieee802154 => todo!(),
+    };
+    config2.random_seed = rand::random();
+
+    let mut iface2: Interface = Interface::new(config2, &mut device);
+
     let mut sockets = SocketSet::new(vec![]);
+    let mut sockets2 = SocketSet::new(vec![]);
     let ll_prefix = &IPV6_PREFIX_LINK_LOCAL_UNICAST;
     let ll_addr = IpCidr::new(
         ipv6_from_prefix(ll_prefix, &mac).into_address(),
@@ -506,6 +518,16 @@ fn main() {
         iface: &mut iface,
         fd: fd
     };
+
+    let mut network_state2 = NetworkState {
+        sockets: &mut sockets2,
+        device: &device_refcell,
+        iface: &mut iface2,
+        fd: fd
+    };
+
+    let test_addr = Ipv6Cidr::new(Ipv6Address([0xfe, 0x80, 0x0, 0x0, 0x0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),64);
+    set_ipv6_addr(network_state2.iface, test_addr, verbose);
 
     let ra_result = obtain_public_ip6_via_ra(
         &mut network_state,
@@ -532,6 +554,7 @@ fn main() {
     set_ipv6_addr(network_state.iface, selected_ip, verbose);
 
     network_state.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
+    network_state2.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
 
     let remote_addr = Ipv6Address(
         [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
@@ -543,11 +566,20 @@ fn main() {
         num_pings,
         verbose);
 
+    let received2 = ping6(
+        &network_state2,
+        &remote_addr,
+        num_pings,
+        verbose);
+
+    let received3 = ping6(
+        &network_state,
         &remote_addr,
         num_pings,
         verbose);
 
     print_json_result(true, num_pings, received);
+    print_json_result(true, num_pings, received2);
 
     if num_pings - received > ping_allowed_drops {
         std::process::exit(1);
