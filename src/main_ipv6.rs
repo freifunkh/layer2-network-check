@@ -5,8 +5,6 @@ use std::cmp;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 
-use std::cell::RefCell;
-
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress,
@@ -164,18 +162,42 @@ pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress, verb
     return None;
 }
 
-struct NetworkState<'a, D : Device> {
-    sockets: &'a mut SocketSet<'a>,
-    device: &'a RefCell<D>,
-    iface: &'a mut Interface,
+struct NetworkState<'a> {
+    sockets: SocketSet<'a>,
+    device: RawSocket,
+    iface: Interface,
     fd: i32
 }
 
-fn obtain_public_ip6_via_ra<D>(network_state: &mut NetworkState<D>,
+impl<'a> NetworkState<'a> {
+    fn new(iface_name: &str, mac: &EthernetAddress) -> NetworkState<'a> {
+        let mut device = RawSocket::new(&iface_name, Medium::Ethernet).unwrap();
+        let fd = device.as_raw_fd();
+
+        let mut config = match device.capabilities().medium {
+            Medium::Ethernet => {
+                Config::new((*mac).into()).into()
+            }
+            Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
+            Medium::Ieee802154 => todo!(),
+        };
+        config.random_seed = rand::random();
+        let iface: Interface = Interface::new(config, &mut device);
+
+        let sockets = SocketSet::new(vec![]);
+
+        return NetworkState {
+            sockets: sockets,
+            device: device,
+            iface: iface,
+            fd: fd
+        };
+    }
+}
+
+fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
     remote_addr: &Ipv6Address, mac: & EthernetAddress, verbose: bool)
         -> Option<(Ipv6Cidr, Ipv6Address)>
-where
-    D: Device
 {
     // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
@@ -193,7 +215,7 @@ where
 
     loop {
         let timestamp = Instant::now();
-        network_state.iface.poll(timestamp, &mut * network_state.device.borrow_mut(), network_state.sockets);
+        network_state.iface.poll(timestamp, &mut network_state.device, &mut network_state.sockets);
 
         let timestamp = Instant::now();
         let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -257,11 +279,9 @@ where
 }
 
 
-fn ping6<D>(network_state: &NetworkState<D>,
+fn ping6(network_state: &mut NetworkState,
     remote_addr: &Ipv6Address, num_pings: u16, verbose: bool)
         -> u16
-where
-    D: Device
 {
     // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
@@ -280,11 +300,11 @@ where
 
     let timeout = Duration::from_secs(1);
     let interval = Duration::from_secs(1);
-    let device_caps = network_state.device.borrow().capabilities();
+    let device_caps = network_state.device.capabilities();
 
     loop {
         let timestamp = Instant::now();
-        network_state.iface.poll(timestamp, &mut *network_state.device.borrow_mut(), network_state.sockets);
+        network_state.iface.poll(timestamp, &mut network_state.device, &mut network_state.sockets);
 
         let timestamp = Instant::now();
         let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
@@ -387,8 +407,7 @@ fn print_json_result(address_obtained: bool, pings_sent: u16, pings_answered: u1
 
 fn main() {
 
-    let (mut opts, mut free) = utils::create_options();
-    utils::add_middleware_options(&mut opts, &mut free);
+    let (mut opts, _) = utils::create_options();
 
     opts.optopt(
         "r",
@@ -449,19 +468,13 @@ fn main() {
         .unwrap_or(1);
     let verbose = args.opt_present("verbose");
 
-    let mut matches = utils::parse_options(&opts, free);
-    let device = RawSocket::new(&iface_name, Medium::Ethernet).unwrap();
-
-    let fd = device.as_raw_fd();
-    let mut device =
-        utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
 
     let mac_str = match args.opt_str("mac") {
         Some(mac_str) => mac_str,
         None => {
             let mac_str_file_content = fs::read_to_string(
                 Path::new("/sys/class/net/")
-                    .join(iface_name)
+                    .join(&iface_name)
                     .join("address")).unwrap();
             mac_str_file_content.strip_suffix("\n").unwrap().to_owned()
         }
@@ -472,62 +485,17 @@ fn main() {
         println!("Using MAC: {}.", mac_str);
     }
 
-    // Create interface
-    let mut config = match device.capabilities().medium {
-        Medium::Ethernet => {
-            Config::new(mac.into()).into()
-        }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
-        Medium::Ieee802154 => todo!(),
-    };
-    config.random_seed = rand::random();
-    let mut iface: Interface = Interface::new(config, &mut device);
-
-    let mut config2 = match device.capabilities().medium {
-        Medium::Ethernet => {
-            Config::new(mac.into()).into()
-        }
-        Medium::Ip => Config::new(smoltcp::wire::HardwareAddress::Ip),
-        Medium::Ieee802154 => todo!(),
-    };
-    config2.random_seed = rand::random();
-
-    let mut iface2: Interface = Interface::new(config2, &mut device);
-
-    let mut sockets = SocketSet::new(vec![]);
-    let mut sockets2 = SocketSet::new(vec![]);
     let ll_prefix = &IPV6_PREFIX_LINK_LOCAL_UNICAST;
-    let ll_addr = IpCidr::new(
-        ipv6_from_prefix(ll_prefix, &mac).into_address(),
+    let ll_addr = Ipv6Cidr::new(
+        ipv6_from_prefix(ll_prefix, &mac),
         64
     );
-    iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
-            .push(ll_addr.clone())
-            .unwrap();
-    });
-    if verbose {
-        println!("Assigned IP: {}", ll_addr);
-    }
 
-    let device_refcell = RefCell::new(device);
+    let mut network_state = NetworkState::new(&iface_name, &mac);
+    let mut network_state2 = NetworkState::new(&iface_name, &mac);
 
-    let mut network_state = NetworkState {
-        sockets: &mut sockets,
-        device: &device_refcell,
-        iface: &mut iface,
-        fd: fd
-    };
-
-    let mut network_state2 = NetworkState {
-        sockets: &mut sockets2,
-        device: &device_refcell,
-        iface: &mut iface2,
-        fd: fd
-    };
-
-    let test_addr = Ipv6Cidr::new(Ipv6Address([0xfe, 0x80, 0x0, 0x0, 0x0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),64);
-    set_ipv6_addr(network_state2.iface, test_addr, verbose);
+    set_ipv6_addr(&mut network_state.iface, ll_addr, verbose);
+    set_ipv6_addr(&mut network_state2.iface, ll_addr, verbose);
 
     let ra_result = obtain_public_ip6_via_ra(
         &mut network_state,
@@ -551,7 +519,8 @@ fn main() {
         println!("Assigned Router: {}", selected_router);
     }
 
-    set_ipv6_addr(network_state.iface, selected_ip, verbose);
+    set_ipv6_addr(&mut network_state.iface, selected_ip, verbose);
+    set_ipv6_addr(&mut network_state2.iface, selected_ip, verbose);
 
     network_state.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
     network_state2.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
@@ -561,19 +530,13 @@ fn main() {
     let num_pings = 4;
 
     let received = ping6(
-        &network_state,
+        &mut network_state,
         &remote_addr,
         num_pings,
         verbose);
 
     let received2 = ping6(
-        &network_state2,
-        &remote_addr,
-        num_pings,
-        verbose);
-
-    let received3 = ping6(
-        &network_state,
+        &mut network_state2,
         &remote_addr,
         num_pings,
         verbose);
