@@ -4,13 +4,12 @@ mod utils;
 extern crate libc;
 
 use std::os::unix::io::RawFd;
-use std::{io, mem, ptr};
 
 use std::cmp;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress,
     NdiscPrefixInformation, Icmpv6Repr, RawHardwareAddress};
@@ -211,6 +210,106 @@ impl<'a> GetFDs for Vec<NetworkState<'a>> {
             res.push(network_state.fd);
         }
         return res;
+    }
+}
+
+trait NetworkTask<'a> {
+    fn init(&mut self, network_state: &mut NetworkState<'a>);
+    fn maybe_send(&'a mut self, now: Instant, network_state: &'a mut NetworkState<'a>);
+    fn maybe_recv(&self);
+    fn can_send(&'a self, network_state: &'a NetworkState<'a>) -> bool;
+    fn can_recv(&'a self, network_state: &'a NetworkState<'a>) -> bool;
+    fn is_finished(&self) -> bool;
+}
+
+struct PingTask<'a> {
+    socket_handle: SocketHandle,
+
+    // static data
+    num_pings: u16,
+    remote_addr: &'a Ipv6Address,
+    ident: u16,
+    interval: Duration,
+
+    // dynamic data
+    send_next_at: Instant,
+    seq_no: u16,
+}
+
+impl<'a> PingTask<'a> {
+    fn get_socket_mut(&self, network_state: &'a mut NetworkState<'a>) -> &'a mut icmp::Socket<'a> {
+        network_state.sockets.get_mut::<icmp::Socket>(self.socket_handle)
+    }
+
+    fn get_socket(&'a self, network_state: &'a NetworkState<'a>) -> &'a icmp::Socket {
+        network_state.sockets.get::<icmp::Socket>(self.socket_handle)
+    }
+}
+
+impl<'a> NetworkTask<'a> for PingTask<'a> {
+    fn init(&mut self, network_state: &mut NetworkState<'a>) {
+        let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+        let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+
+        let mut socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
+
+        socket.bind(icmp::Endpoint::IPv6Ndisc).unwrap();
+        socket.set_hop_limit(Some(255));
+
+        self.send_next_at = Instant::from_millis(0);
+        self.socket_handle = network_state.sockets.add(socket);
+
+        let mut rng = rand::thread_rng();
+        self.ident = rng.gen();
+        self.interval = Duration::from_secs(1);
+    }
+
+    fn can_send(&'a self, network_state: &'a NetworkState<'a>) -> bool {
+        self.get_socket(network_state).can_send()
+    }
+
+    fn can_recv(&'a self, network_state: &'a NetworkState<'a>) -> bool {
+        self.get_socket(network_state).can_recv()
+    }
+
+    fn maybe_send(&'a mut self, now: Instant, network_state: &'a mut NetworkState<'a>) {
+        if self.send_next_at < now {
+            return;
+        }
+
+        let src_addr = &network_state.iface.ipv6_addr().unwrap().into_address();
+        let device_caps = network_state.device.capabilities();
+        let mut echo_payload = [0xffu8; 40];
+
+        NetworkEndian::write_i64(&mut echo_payload, now.total_millis());
+
+        let socket = self.get_socket_mut(network_state);
+        let (icmp_repr, mut icmp_packet) = send_icmp_ping!(
+            Icmpv6Repr,
+            Icmpv6Packet,
+            self.ident,
+            self.seq_no,
+            echo_payload,
+            socket,
+            self.remote_addr.into_address()
+        );
+        icmp_repr.emit(
+            src_addr,
+            &self.remote_addr.into_address(),
+            &mut icmp_packet,
+            &device_caps.checksum,
+        );
+
+        self.seq_no += 1;
+        self.send_next_at += self.interval;
+    }
+
+    fn maybe_recv(&self) {
+
+    }
+
+    fn is_finished(&self) -> bool {
+        self.seq_no >= self.num_pings
     }
 }
 
