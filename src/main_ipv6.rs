@@ -1,6 +1,11 @@
 #![allow(clippy::option_map_unit_fn)]
 mod utils;
 
+extern crate libc;
+
+use std::os::unix::io::RawFd;
+use std::{io, mem, ptr};
+
 use std::cmp;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
@@ -192,6 +197,20 @@ impl<'a> NetworkState<'a> {
             iface: iface,
             fd: fd
         };
+    }
+}
+
+trait GetFDs {
+    fn get_fds(&self) -> Vec<RawFd>;
+}
+
+impl<'a> GetFDs for Vec<NetworkState<'a>> {
+    fn get_fds(&self) -> Vec<RawFd> {
+        let mut res = Vec::new();
+        for network_state in self.iter() {
+            res.push(network_state.fd);
+        }
+        return res;
     }
 }
 
@@ -491,14 +510,18 @@ fn main() {
         64
     );
 
-    let mut network_state = NetworkState::new(&iface_name, &mac);
-    let mut network_state2 = NetworkState::new(&iface_name, &mac);
+    let network_state = NetworkState::new(&iface_name, &mac);
+    let network_state2 = NetworkState::new(&iface_name, &mac);
 
-    set_ipv6_addr(&mut network_state.iface, ll_addr, verbose);
-    set_ipv6_addr(&mut network_state2.iface, ll_addr, verbose);
+    let mut network_states = vec![network_state, network_state2];
+
+    let fds = network_states.get_fds();
+
+    set_ipv6_addr(&mut network_states[0].iface, ll_addr, verbose);
+    set_ipv6_addr(&mut network_states[1].iface, ll_addr, verbose);
 
     let ra_result = obtain_public_ip6_via_ra(
-        &mut network_state,
+        &mut network_states[0],
         &remote_addr,
         &mac,
         verbose
@@ -519,24 +542,24 @@ fn main() {
         println!("Assigned Router: {}", selected_router);
     }
 
-    set_ipv6_addr(&mut network_state.iface, selected_ip, verbose);
-    set_ipv6_addr(&mut network_state2.iface, selected_ip, verbose);
+    set_ipv6_addr(&mut network_states[0].iface, selected_ip, verbose);
+    set_ipv6_addr(&mut network_states[1].iface, selected_ip, verbose);
 
-    network_state.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
-    network_state2.iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
+    network_states[0].iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
+    network_states[1].iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
 
     let remote_addr = Ipv6Address(
         [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
     let num_pings = 4;
 
     let received = ping6(
-        &mut network_state,
+        &mut network_states[0],
         &remote_addr,
         num_pings,
         verbose);
 
     let received2 = ping6(
-        &mut network_state2,
+        &mut network_states[1],
         &remote_addr,
         num_pings,
         verbose);

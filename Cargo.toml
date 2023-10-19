@@ -21,6 +21,7 @@ getopts = "0.2"
 rand = "0.8"
 url = "2.0"
 byteorder = "1.4.3"
+libc = "0.2"
 
 [features]
 log = []
