@@ -214,11 +214,11 @@ impl<'a> GetFDs for Vec<NetworkState<'a>> {
 }
 
 trait NetworkTask<'a> {
-    fn init(&mut self, network_state: &mut NetworkState<'a>);
-    fn maybe_send(&'a mut self, now: Instant, network_state: &'a mut NetworkState<'a>);
-    fn maybe_recv(&self);
-    fn can_send(&'a self, network_state: &'a NetworkState<'a>) -> bool;
-    fn can_recv(&'a self, network_state: &'a NetworkState<'a>) -> bool;
+    fn maybe_send<'b>(&mut self, now: Instant, network_state: &'b mut NetworkState<'a>);
+    fn maybe_recv(&mut self, now: Instant, network_state: &mut NetworkState<'a>, verbose: bool);
+    fn housekeeping(&mut self, now: Instant, verbose: bool);
+    fn can_send(&self, network_state: &NetworkState<'a>) -> bool;
+    fn can_recv(&self, network_state: &NetworkState<'a>) -> bool;
     fn is_finished(&self) -> bool;
 }
 
@@ -230,50 +230,64 @@ struct PingTask<'a> {
     remote_addr: &'a Ipv6Address,
     ident: u16,
     interval: Duration,
+    timeout: Duration,
 
     // dynamic data
     send_next_at: Instant,
     seq_no: u16,
+    received: u16,
+    waiting_queue: HashMap<u16, Instant>,
 }
 
 impl<'a> PingTask<'a> {
-    fn get_socket_mut(&self, network_state: &'a mut NetworkState<'a>) -> &'a mut icmp::Socket<'a> {
+    fn new(network_state: &mut NetworkState<'a>, remote_addr: &'a Ipv6Address) -> PingTask<'a> {
+        let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+        let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
+
+        let mut socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
+        let mut rng = rand::thread_rng();
+        let ident = rng.gen();
+
+        socket.bind(icmp::Endpoint::Ident(ident)).unwrap();
+        socket.set_hop_limit(Some(255));
+
+        let socket_handle = network_state.sockets.add(socket);
+
+        PingTask {
+            socket_handle: socket_handle,
+            num_pings: 4,
+            remote_addr: remote_addr,
+            ident: ident,
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            send_next_at: Instant::now(),
+            seq_no: 0,
+            received: 0,
+            waiting_queue: HashMap::new(),
+        }
+    }
+
+    fn get_socket_mut<'b>(&self, network_state: &'b mut NetworkState<'a>) -> &'b mut icmp::Socket<'a> {
         network_state.sockets.get_mut::<icmp::Socket>(self.socket_handle)
     }
 
-    fn get_socket(&'a self, network_state: &'a NetworkState<'a>) -> &'a icmp::Socket {
+    fn get_socket<'b>(&self, network_state: &'b NetworkState<'a>) -> &'b icmp::Socket {
         network_state.sockets.get::<icmp::Socket>(self.socket_handle)
     }
 }
 
 impl<'a> NetworkTask<'a> for PingTask<'a> {
-    fn init(&mut self, network_state: &mut NetworkState<'a>) {
-        let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-        let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
 
-        let mut socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-
-        socket.bind(icmp::Endpoint::IPv6Ndisc).unwrap();
-        socket.set_hop_limit(Some(255));
-
-        self.send_next_at = Instant::from_millis(0);
-        self.socket_handle = network_state.sockets.add(socket);
-
-        let mut rng = rand::thread_rng();
-        self.ident = rng.gen();
-        self.interval = Duration::from_secs(1);
-    }
-
-    fn can_send(&'a self, network_state: &'a NetworkState<'a>) -> bool {
+    fn can_send<'b>(&self, network_state: &'b NetworkState<'a>) -> bool {
         self.get_socket(network_state).can_send()
     }
 
-    fn can_recv(&'a self, network_state: &'a NetworkState<'a>) -> bool {
+    fn can_recv<'b>(&self, network_state: &'b NetworkState<'a>) -> bool {
         self.get_socket(network_state).can_recv()
     }
 
-    fn maybe_send(&'a mut self, now: Instant, network_state: &'a mut NetworkState<'a>) {
-        if self.send_next_at < now {
+    fn maybe_send<'b>(&mut self, now: Instant, network_state: &'b mut NetworkState<'a>) {
+        if self.send_next_at > now || self.seq_no >= self.num_pings {
             return;
         }
 
@@ -300,16 +314,59 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
             &device_caps.checksum,
         );
 
+        self.waiting_queue.insert(self.seq_no, now);
         self.seq_no += 1;
         self.send_next_at += self.interval;
     }
 
-    fn maybe_recv(&self) {
+    fn maybe_recv(&mut self, now: Instant, network_state: &mut NetworkState<'a>, verbose: bool) {
 
+        let dst_addr = &network_state.iface.ipv6_addr().unwrap().into_address();
+        let device_caps = network_state.device.capabilities();
+
+        let socket = self.get_socket_mut(network_state);
+        let (payload, _) = socket.recv().unwrap();
+
+        let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
+        let maybe_icmp_repr = Icmpv6Repr::parse(
+            &self.remote_addr.into_address(),
+            dst_addr,
+            &icmp_packet,
+            &device_caps.checksum,
+        );
+
+        if let Ok(icmp_repr) = maybe_icmp_repr {
+            get_icmp_pong!(
+                Icmpv6Repr,
+                icmp_repr,
+                payload,
+                self.waiting_queue,
+                self.remote_addr,
+                now,
+                self.received,
+                verbose
+            );
+        } else {
+            println!("ignored packet");
+        }
     }
 
     fn is_finished(&self) -> bool {
-        self.seq_no >= self.num_pings
+        self.seq_no >= self.num_pings && self.waiting_queue.is_empty()
+    }
+
+    fn housekeeping(&mut self, now: Instant, verbose: bool) {
+        self.waiting_queue.retain(|seq, from| {
+            let remote_addr = self.remote_addr;
+            if now - *from < self.timeout {
+                true
+            } else {
+                if verbose {
+                    println!("From {remote_addr} icmp_seq={seq} timeout");
+                }
+                false
+            }
+        });
     }
 }
 
@@ -397,110 +454,42 @@ fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
 }
 
 
-fn ping6(network_state: &mut NetworkState,
-    remote_addr: &Ipv6Address, num_pings: u16, verbose: bool)
+fn ping6<'a>(network_state: &mut NetworkState<'a>,
+    remote_addr: &'a Ipv6Address, verbose: bool)
         -> u16
 {
-    // Create sockets
-    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    let icmp_handle = network_state.sockets.add(icmp_socket);
-
-    let mut send_at = Instant::from_millis(0);
-    let mut seq_no = 0;
-    let mut received = 0;
-    let mut echo_payload = [0xffu8; 40];
-    let mut waiting_queue = HashMap::new();
-
-    let mut rng = rand::thread_rng();
-    let ident: u16 = rng.gen();
-
-    let timeout = Duration::from_secs(1);
-    let interval = Duration::from_secs(1);
-    let device_caps = network_state.device.capabilities();
+    let mut ping_task = PingTask::new(network_state, remote_addr);
 
     loop {
-        let timestamp = Instant::now();
-        network_state.iface.poll(timestamp, &mut network_state.device, &mut network_state.sockets);
+        let now = Instant::now();
 
-        let timestamp = Instant::now();
-        let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
-        if !socket.is_open() {
-            socket.bind(icmp::Endpoint::Ident(ident)).unwrap();
-            send_at = timestamp;
+        network_state.iface.poll(now, &mut network_state.device, &mut network_state.sockets);
+
+        let now = Instant::now();
+        let can_send = ping_task.can_send(&network_state);
+        if can_send {
+            ping_task.maybe_send(now, network_state)
         }
 
-        if socket.can_send() && seq_no < num_pings as u16 && send_at <= timestamp {
-            NetworkEndian::write_i64(&mut echo_payload, timestamp.total_millis());
-
-            let (icmp_repr, mut icmp_packet) = send_icmp_ping!(
-                Icmpv6Repr,
-                Icmpv6Packet,
-                ident,
-                seq_no,
-                echo_payload,
-                socket,
-                remote_addr.into_address()
-            );
-            icmp_repr.emit(
-                &network_state.iface.ipv6_addr().unwrap().into_address(),
-                &remote_addr.into_address(),
-                &mut icmp_packet,
-                &device_caps.checksum,
-            );
-
-            waiting_queue.insert(seq_no, timestamp);
-            seq_no += 1;
-            send_at += interval;
+        if ping_task.can_recv(&network_state) {
+            ping_task.maybe_recv(now, network_state, verbose)
         }
 
-        if socket.can_recv() {
-            let (payload, _) = socket.recv().unwrap();
+        ping_task.housekeeping(now, verbose);
 
-            let icmp_packet = Icmpv6Packet::new_checked(&payload).unwrap();
-            let icmp_repr = Icmpv6Repr::parse(
-                &remote_addr.into_address(),
-                &network_state.iface.ipv6_addr().unwrap().into_address(),
-                &icmp_packet,
-                &device_caps.checksum,
-            ).unwrap();
-            get_icmp_pong!(
-                Icmpv6Repr,
-                icmp_repr,
-                payload,
-                waiting_queue,
-                remote_addr,
-                timestamp,
-                received,
-                verbose
-            );
-        }
-
-        waiting_queue.retain(|seq, from| {
-            if timestamp - *from < timeout {
-                true
-            } else {
-                if verbose {
-                    println!("From {remote_addr} icmp_seq={seq} timeout");
-                }
-                false
-            }
-        });
-
-        if seq_no == num_pings as u16 && waiting_queue.is_empty() {
+        if ping_task.is_finished() {
             break;
         }
 
         let timestamp = Instant::now();
         match network_state.iface.poll_at(timestamp, &network_state.sockets) {
             Some(poll_at) if timestamp < poll_at => {
-                let resume_at = cmp::min(poll_at, send_at);
+                let resume_at = cmp::min(poll_at, ping_task.send_next_at);
                 phy_wait(network_state.fd, Some(resume_at - timestamp)).expect("wait error");
             }
             Some(_) => (),
             None => {
-                phy_wait(network_state.fd, Some(send_at - timestamp)).expect("wait error");
+                phy_wait(network_state.fd, Some(ping_task.send_next_at - timestamp)).expect("wait error");
             }
         }
     }
@@ -509,13 +498,13 @@ fn ping6(network_state: &mut NetworkState,
         println!("--- {remote_addr} ping statistics ---");
         println!(
             "{} packets transmitted, {} received, {:.0}% packet loss",
-            seq_no,
-            received,
-            100.0 * (seq_no - received) as f64 / seq_no as f64
+            &ping_task.seq_no,
+            &ping_task.received,
+            100.0 * (ping_task.seq_no - ping_task.received) as f64 / ping_task.seq_no as f64
         );
     }
 
-    return received
+    return ping_task.received
 }
 
 fn print_json_result(address_obtained: bool, pings_sent: u16, pings_answered: u16) {
@@ -649,24 +638,21 @@ fn main() {
 
     let remote_addr = Ipv6Address(
         [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
-    let num_pings = 4;
 
     let received = ping6(
         &mut network_states[0],
         &remote_addr,
-        num_pings,
         verbose);
 
     let received2 = ping6(
         &mut network_states[1],
         &remote_addr,
-        num_pings,
         verbose);
 
-    print_json_result(true, num_pings, received);
-    print_json_result(true, num_pings, received2);
+    print_json_result(true, 4, received);
+    print_json_result(true, 4, received2);
 
-    if num_pings - received > ping_allowed_drops {
+    if 4 - received > ping_allowed_drops {
         std::process::exit(1);
     }
 }
