@@ -224,6 +224,7 @@ trait NetworkTask<'a> {
     fn can_send(&self, network_state: &NetworkState<'a>) -> bool;
     fn can_recv(&self, network_state: &NetworkState<'a>) -> bool;
     fn is_finished(&self) -> bool;
+    fn do_everything(&mut self, network_state: &mut NetworkState<'a>, now: Instant, verbose: bool);
 }
 
 struct PingTask<'a> {
@@ -372,6 +373,18 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
             }
         });
     }
+
+    fn do_everything(&mut self, network_state: &mut NetworkState<'a>, now: Instant, verbose: bool) {
+        if self.can_send(&network_state) {
+            self.maybe_send(now, network_state)
+        }
+
+        if self.can_recv(&network_state) {
+            self.maybe_recv(now, network_state, verbose)
+        }
+
+        self.housekeeping(now, verbose);
+    }
 }
 
 fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
@@ -470,16 +483,8 @@ fn ping6<'a>(network_state: &mut NetworkState<'a>,
         network_state.send_from_and_receive_to_sockets(now);
 
         let now = Instant::now();
-        let can_send = ping_task.can_send(&network_state);
-        if can_send {
-            ping_task.maybe_send(now, network_state)
-        }
 
-        if ping_task.can_recv(&network_state) {
-            ping_task.maybe_recv(now, network_state, verbose)
-        }
-
-        ping_task.housekeeping(now, verbose);
+        ping_task.do_everything(network_state, now, verbose);
 
         if ping_task.is_finished() {
             break;
