@@ -197,6 +197,10 @@ impl<'a> NetworkState<'a> {
             fd: fd
         };
     }
+
+    fn send_from_and_receive_to_sockets(&mut self, now: Instant) {
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
+    }
 }
 
 trait GetFDs {
@@ -463,7 +467,7 @@ fn ping6<'a>(network_state: &mut NetworkState<'a>,
     loop {
         let now = Instant::now();
 
-        network_state.iface.poll(now, &mut network_state.device, &mut network_state.sockets);
+        network_state.send_from_and_receive_to_sockets(now);
 
         let now = Instant::now();
         let can_send = ping_task.can_send(&network_state);
