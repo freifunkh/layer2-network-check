@@ -3,11 +3,13 @@ mod utils;
 
 extern crate libc;
 
+use std::cell::RefCell;
 use std::os::unix::io::RawFd;
 
 use std::cmp;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
+use std::rc::Rc;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::time::Instant;
@@ -170,7 +172,9 @@ struct NetworkState<'a> {
     sockets: SocketSet<'a>,
     device: RawSocket,
     iface: Interface,
-    fd: i32
+    fd: i32,
+
+    tasks: Rc<RefCell<Vec<PingTask<'a>>>>,
 }
 
 impl<'a> NetworkState<'a> {
@@ -194,7 +198,8 @@ impl<'a> NetworkState<'a> {
             sockets: sockets,
             device: device,
             iface: iface,
-            fd: fd
+            fd: fd,
+            tasks: Rc::new(RefCell::new(vec![]))
         };
     }
 
@@ -473,52 +478,60 @@ fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
 
 fn ping6<'a>(network_state: &mut NetworkState<'a>,
     remote_addr: &'a Ipv6Address, verbose: bool)
-        -> u16
 {
-    let mut ping_task = PingTask::new(network_state, remote_addr);
+    let ping_task = PingTask::new(network_state, remote_addr);
+    let mut ping_task2 = PingTask::new(network_state, remote_addr);
+
+    ping_task2.send_next_at += Duration::from_millis(500);
+
+    network_state.tasks.borrow_mut().push(ping_task);
+    network_state.tasks.borrow_mut().push(ping_task2);
 
     loop {
         let now = Instant::now();
 
         network_state.send_from_and_receive_to_sockets(now);
 
-        let now = Instant::now();
+        let now: Instant = Instant::now();
+        let mut are_task_left = false;
 
-        ping_task.do_everything(network_state, now, verbose);
+        let tasks = network_state.tasks.clone();
+        let mut next_send_at : Option<Instant> = None;
 
-        if ping_task.is_finished() {
+        // tasks.borrow_mut() panics if tasks is already mutuably borrowed.
+        for task in tasks.borrow_mut().iter_mut() {
+            if task.is_finished() {
+                continue;
+            }
+
+            are_task_left = true;
+            next_send_at = match next_send_at {
+                Some(val) => Some(cmp::min(val, task.send_next_at)),
+                None => Some(task.send_next_at)
+            };
+
+            task.do_everything(network_state, now, verbose);
+        }
+
+        if !are_task_left {
             break;
         }
+
+        // We are sure now, that there is a task...
+        let next_send_at = next_send_at.unwrap();
 
         let timestamp = Instant::now();
         match network_state.iface.poll_at(timestamp, &network_state.sockets) {
             Some(poll_at) if timestamp < poll_at => {
-                let resume_at = cmp::min(poll_at, ping_task.send_next_at);
+                let resume_at = cmp::min(poll_at, next_send_at);
                 phy_wait(network_state.fd, Some(resume_at - timestamp)).expect("wait error");
             }
             Some(_) => (),
             None => {
-                phy_wait(network_state.fd, Some(ping_task.send_next_at - timestamp)).expect("wait error");
+                phy_wait(network_state.fd, Some(next_send_at - timestamp)).expect("wait error");
             }
         }
     }
-
-    if verbose {
-        println!("--- {remote_addr} ping statistics ---");
-        println!(
-            "{} packets transmitted, {} received, {:.0}% packet loss",
-            &ping_task.seq_no,
-            &ping_task.received,
-            100.0 * (ping_task.seq_no - ping_task.received) as f64 / ping_task.seq_no as f64
-        );
-    }
-
-    return ping_task.received
-}
-
-fn print_json_result(address_obtained: bool, pings_sent: u16, pings_answered: u16) {
-    println!("{{ \"address_obtained\": {}, \"echo_requests\": {{ \"sent\": {}, \"answered\": {} }} }}",
-        address_obtained as i32, pings_sent, pings_answered);
 }
 
 fn main() {
@@ -578,10 +591,6 @@ fn main() {
     let iface_name = args
         .opt_str("interface")
         .unwrap_or("wlp3s0".into());
-    let ping_allowed_drops = args
-        .opt_str("allowed-drops")
-        .map(|s| s.parse().unwrap() )
-        .unwrap_or(1);
     let verbose = args.opt_present("verbose");
 
 
@@ -628,7 +637,6 @@ fn main() {
         if verbose {
             println!("Did not obtain a public ip via RA.");
         }
-        print_json_result(false, 0, 0);
         std::process::exit(1);
     }
 
@@ -648,22 +656,15 @@ fn main() {
     let remote_addr = Ipv6Address(
         [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
 
-    let received = ping6(
+    ping6(
         &mut network_states[0],
         &remote_addr,
         verbose);
 
-    let received2 = ping6(
+    ping6(
         &mut network_states[1],
         &remote_addr,
         verbose);
-
-    print_json_result(true, 4, received);
-    print_json_result(true, 4, received2);
-
-    if 4 - received > ping_allowed_drops {
-        std::process::exit(1);
-    }
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr, verbose: bool) {
