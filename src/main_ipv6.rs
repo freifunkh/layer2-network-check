@@ -227,6 +227,16 @@ impl<'a> NetworkState<'a> {
 
         return res;
     }
+
+    fn has_pending_tasks(&self) -> bool {
+        let mut res = false;
+
+        for task in self.tasks.borrow().iter() {
+            res = res || !task.is_finished();
+        }
+
+        return res;
+    }
 }
 
 trait GetFDs {
@@ -531,7 +541,6 @@ fn ping6<'a>(network_state: &mut NetworkState<'a>,
         network_state.send_from_and_receive_to_sockets(now);
 
         let now: Instant = Instant::now();
-        let mut are_task_left = false;
 
         let tasks = network_state.tasks.clone();
 
@@ -542,13 +551,9 @@ fn ping6<'a>(network_state: &mut NetworkState<'a>,
             }
 
             task.do_everything(network_state, now, verbose);
-
-            if !task.is_finished() {
-                are_task_left = true;
-            }
         }
 
-        if !are_task_left {
+        if !network_state.has_pending_tasks() {
             break;
         }
 
