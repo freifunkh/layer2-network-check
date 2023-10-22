@@ -6,7 +6,7 @@ extern crate libc;
 use std::cell::RefCell;
 use std::os::unix::io::RawFd;
 
-use std::cmp;
+use std::{cmp, mem, io, ptr};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
@@ -34,6 +34,58 @@ use std::fs;
 use std::path::Path;
 
 use rand::Rng;
+
+
+/// Wait until given file descriptor becomes readable, but no longer than given timeout.
+pub fn wait_fds(fds: Vec<RawFd>, duration: Option<Duration>) -> io::Result<()> {
+    unsafe {
+        let mut readfds = {
+            let mut readfds = mem::MaybeUninit::<libc::fd_set>::uninit();
+            libc::FD_ZERO(readfds.as_mut_ptr());
+            for fd in fds.iter() {
+                libc::FD_SET(*fd, readfds.as_mut_ptr());
+            }
+            readfds.assume_init()
+        };
+
+        let mut writefds = {
+            let mut writefds = mem::MaybeUninit::<libc::fd_set>::uninit();
+            libc::FD_ZERO(writefds.as_mut_ptr());
+            writefds.assume_init()
+        };
+
+        let mut exceptfds = {
+            let mut exceptfds = mem::MaybeUninit::<libc::fd_set>::uninit();
+            libc::FD_ZERO(exceptfds.as_mut_ptr());
+            exceptfds.assume_init()
+        };
+
+        let mut timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let timeout_ptr = if let Some(duration) = duration {
+            timeout.tv_sec = duration.secs() as libc::time_t;
+            timeout.tv_usec = (duration.millis() * 1_000) as libc::suseconds_t;
+            &mut timeout as *mut _
+        } else {
+            ptr::null_mut()
+        };
+
+        let res = libc::select(
+            fds.iter().max().unwrap_or(&0).clone() + 1,
+            &mut readfds,
+            &mut writefds,
+            &mut exceptfds,
+            timeout_ptr,
+        );
+        if res == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 
 macro_rules! send_icmp_ping {
     ( $repr_type:ident, $packet_type:ident, $ident:expr, $seq_no:expr,
@@ -228,6 +280,10 @@ impl<'a> NetworkState<'a> {
         return res;
     }
 
+    fn add_task(&mut self, task: PingTask<'a>) {
+        self.tasks.borrow_mut().push(task);
+    }
+
     fn has_pending_tasks(&self) -> bool {
         let mut res = false;
 
@@ -236,6 +292,19 @@ impl<'a> NetworkState<'a> {
         }
 
         return res;
+    }
+
+    fn handle_tasks(&mut self, now: Instant, verbose: bool) {
+        let tasks = self.tasks.clone();
+
+        // tasks.borrow_mut() panics if tasks is already mutuably borrowed.
+        for task in tasks.borrow_mut().iter_mut() {
+            if task.is_finished() {
+                continue;
+            }
+
+            task.do_everything(self, now, verbose);
+        }
     }
 }
 
@@ -524,54 +593,40 @@ fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
 }
 
 
-fn ping6<'a>(network_state: &mut NetworkState<'a>,
-    remote_addr: &'a Ipv6Address, verbose: bool)
-{
-    let ping_task = PingTask::new(network_state, remote_addr);
-    let mut ping_task2 = PingTask::new(network_state, remote_addr);
-
-    ping_task2.send_next_at += Duration::from_millis(500);
-
-    network_state.tasks.borrow_mut().push(ping_task);
-    network_state.tasks.borrow_mut().push(ping_task2);
+fn run_tasks_to_completion<'a>(network_states: &mut Vec<NetworkState<'a>>, verbose: bool) {
 
     loop {
         let now = Instant::now();
 
-        network_state.send_from_and_receive_to_sockets(now);
+        let mut are_tasks_left = false;
+        let mut min_poll_at = None;
 
-        let now: Instant = Instant::now();
+        for network_state in network_states.iter_mut() {
 
-        let tasks = network_state.tasks.clone();
+            network_state.send_from_and_receive_to_sockets(now);
 
-        // tasks.borrow_mut() panics if tasks is already mutuably borrowed.
-        for task in tasks.borrow_mut().iter_mut() {
-            if task.is_finished() {
-                continue;
+            let now: Instant = Instant::now();
+
+            network_state.handle_tasks(now, verbose);
+
+            if network_state.has_pending_tasks() {
+                are_tasks_left = true;
             }
 
-            task.do_everything(network_state, now, verbose);
+            let next_poll_at = network_state.iface.poll_at(now, &network_state.sockets);
+            let next_wakeup_at = network_state.next_wakeup_at();
+
+            min_poll_at = min_option(min_poll_at, min_option(next_poll_at, next_wakeup_at));
         }
 
-        if !network_state.has_pending_tasks() {
-            break;
-        }
-
-        let now = Instant::now();
-
-        let next_poll_at = network_state.iface.poll_at(now, &network_state.sockets);
-        let next_wakeup_at = network_state.next_wakeup_at();
-
-        let resume_at = min_option(next_poll_at, next_wakeup_at);
-
-        if resume_at.is_none() {
+        if min_poll_at.is_none() || !are_tasks_left {
             return;
         }
 
-        let poll_at = resume_at.unwrap();
+        let poll_at = min_poll_at.unwrap();
 
         if now < poll_at {
-            phy_wait(network_state.fd, Some(poll_at - now)).expect("error during wait");
+            wait_fds(network_states.get_fds(), Some(poll_at - now)).expect("error during wait");
         }
     }
 }
@@ -663,8 +718,6 @@ fn main() {
 
     let mut network_states = vec![network_state, network_state2];
 
-    let fds = network_states.get_fds();
-
     set_ipv6_addr(&mut network_states[0].iface, ll_addr, verbose);
     set_ipv6_addr(&mut network_states[1].iface, ll_addr, verbose);
 
@@ -698,15 +751,13 @@ fn main() {
     let remote_addr = Ipv6Address(
         [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
 
-    ping6(
-        &mut network_states[0],
-        &remote_addr,
-        verbose);
+    let ping_task = PingTask::new(&mut network_states[0], &remote_addr);
+    let ping_task2 = PingTask::new(&mut network_states[1], &remote_addr);
 
-    ping6(
-        &mut network_states[1],
-        &remote_addr,
-        verbose);
+    network_states[0].add_task(ping_task);
+    network_states[1].add_task(ping_task2);
+
+    run_tasks_to_completion(&mut network_states, verbose);
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr, verbose: bool) {
