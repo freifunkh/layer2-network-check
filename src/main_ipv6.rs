@@ -76,6 +76,17 @@ macro_rules! get_icmp_pong {
 const IPV6_PREFIX_LINK_LOCAL_UNICAST : Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
 const EUI64_MIDDLE_VALUE: [u8; 2] = [0xff, 0xfe];
 
+fn min_option<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    // Returns the minimal of two options (if both are Some(_)).
+    // Otherwise, it returns a or b depending which of which is Some(_)
+    match (a, b) {
+        (Some(a_val), Some(b_val)) => Some(cmp::min(a_val, b_val)),
+        (Some(a_val), None) => Some(a_val),
+        (None, Some(b_val)) => Some(b_val),
+        (None, None) => None
+    }
+}
+
 pub fn mac_as_eui64(mac: &EthernetAddress) -> [u8; 8] {
     let mut bytes = [0; 8];
     let mac_bytes = mac.as_bytes();
@@ -206,6 +217,16 @@ impl<'a> NetworkState<'a> {
     fn send_from_and_receive_to_sockets(&mut self, now: Instant) {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
+
+    fn next_wakeup_at(&self) -> Option<Instant> {
+        let mut res: Option<Instant> = None;
+
+        for task in self.tasks.borrow().iter() {
+            res = min_option(res, task.next_wakeup_at());
+        }
+
+        return res;
+    }
 }
 
 trait GetFDs {
@@ -230,6 +251,7 @@ trait NetworkTask<'a> {
     fn can_recv(&self, network_state: &NetworkState<'a>) -> bool;
     fn is_finished(&self) -> bool;
     fn do_everything(&mut self, network_state: &mut NetworkState<'a>, now: Instant, verbose: bool);
+    fn next_wakeup_at(&self) -> Option<Instant>;
 }
 
 struct PingTask<'a> {
@@ -283,6 +305,10 @@ impl<'a> PingTask<'a> {
 
     fn get_socket<'b>(&self, network_state: &'b NetworkState<'a>) -> &'b icmp::Socket {
         network_state.sockets.get::<icmp::Socket>(self.socket_handle)
+    }
+
+    fn all_pings_sent(&self) -> bool {
+        self.seq_no >= self.num_pings
     }
 }
 
@@ -362,7 +388,19 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
     }
 
     fn is_finished(&self) -> bool {
-        self.seq_no >= self.num_pings && self.waiting_queue.is_empty()
+        self.all_pings_sent() && self.waiting_queue.is_empty()
+    }
+
+    fn next_wakeup_at(&self) -> Option<Instant> {
+        if self.is_finished() {
+            return None;
+        }
+
+        if self.all_pings_sent() {
+            return Some(self.waiting_queue.values().min().unwrap().clone() + self.timeout);
+        }
+
+        return Some(self.send_next_at);
     }
 
     fn housekeeping(&mut self, now: Instant, verbose: bool) {
@@ -496,7 +534,6 @@ fn ping6<'a>(network_state: &mut NetworkState<'a>,
         let mut are_task_left = false;
 
         let tasks = network_state.tasks.clone();
-        let mut next_send_at : Option<Instant> = None;
 
         // tasks.borrow_mut() panics if tasks is already mutuably borrowed.
         for task in tasks.borrow_mut().iter_mut() {
@@ -504,32 +541,32 @@ fn ping6<'a>(network_state: &mut NetworkState<'a>,
                 continue;
             }
 
-            are_task_left = true;
-            next_send_at = match next_send_at {
-                Some(val) => Some(cmp::min(val, task.send_next_at)),
-                None => Some(task.send_next_at)
-            };
-
             task.do_everything(network_state, now, verbose);
+
+            if !task.is_finished() {
+                are_task_left = true;
+            }
         }
 
         if !are_task_left {
             break;
         }
 
-        // We are sure now, that there is a task...
-        let next_send_at = next_send_at.unwrap();
+        let now = Instant::now();
 
-        let timestamp = Instant::now();
-        match network_state.iface.poll_at(timestamp, &network_state.sockets) {
-            Some(poll_at) if timestamp < poll_at => {
-                let resume_at = cmp::min(poll_at, next_send_at);
-                phy_wait(network_state.fd, Some(resume_at - timestamp)).expect("wait error");
-            }
-            Some(_) => (),
-            None => {
-                phy_wait(network_state.fd, Some(next_send_at - timestamp)).expect("wait error");
-            }
+        let next_poll_at = network_state.iface.poll_at(now, &network_state.sockets);
+        let next_wakeup_at = network_state.next_wakeup_at();
+
+        let resume_at = min_option(next_poll_at, next_wakeup_at);
+
+        if resume_at.is_none() {
+            return;
+        }
+
+        let poll_at = resume_at.unwrap();
+
+        if now < poll_at {
+            phy_wait(network_state.fd, Some(poll_at - now)).expect("error during wait");
         }
     }
 }
