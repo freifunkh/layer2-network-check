@@ -348,6 +348,73 @@ struct PingTask<'a> {
     seq_no: u16,
     received: u16,
     waiting_queue: HashMap<u16, Instant>,
+
+    // result data
+    rtt: SlidingWindowRTT,
+}
+
+struct SlidingWindowRTT {
+    data: Vec<f64>,
+    window_length: usize,
+    last_data_index: usize,
+}
+
+impl SlidingWindowRTT {
+    fn new(window_length: usize) -> SlidingWindowRTT {
+        SlidingWindowRTT {
+            data: Vec::with_capacity(window_length),
+            window_length: window_length,
+            last_data_index: 0
+        }
+    }
+
+    fn add_rtt(&mut self, new_data: f64) {
+        if self.data.len() < self.window_length {
+            // Sliding Window is not yet filled.
+            self.data.push(new_data);
+            self.last_data_index = self.data.len() - 1;
+        } else {
+            // Override existing values
+            let new_index = (self.last_data_index + 1) % self.window_length;
+            self.data[new_index] = new_data;
+            self.last_data_index = new_index;
+        }
+    }
+
+    fn add_lost_package(&mut self) {
+        self.add_rtt(f64::NAN);
+    }
+
+    fn avg_rtt(&self) -> Option<f64> {
+        if self.data.is_empty() {
+            return None;
+        }
+
+        let mut sum = 0.0;
+        let mut count : usize = 0;
+        for d in self.data.iter() {
+            if *d == f64::NAN {
+                continue;
+            }
+            sum += d;
+            count += 1;
+        }
+        Some(sum / count as f64)
+    }
+
+    fn avg_packageloss(&self) -> Option<f64> {
+        if self.data.is_empty() {
+            return None;
+        }
+
+        let mut count : usize = 0;
+        for d in self.data.iter() {
+            if *d == f64::NAN {
+                count += 1;
+            }
+        }
+        Some(count as f64 / self.data.len() as f64)
+    }
 }
 
 impl<'a> PingTask<'a> {
@@ -375,6 +442,7 @@ impl<'a> PingTask<'a> {
             seq_no: 0,
             received: 0,
             waiting_queue: HashMap::new(),
+            rtt: SlidingWindowRTT::new(30),
         }
     }
 
@@ -450,20 +518,23 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
             &device_caps.checksum,
         );
 
-        if let Ok(icmp_repr) = maybe_icmp_repr {
-            get_icmp_pong!(
-                Icmpv6Repr,
-                icmp_repr,
-                payload,
-                self.waiting_queue,
-                self.remote_addr,
-                now,
-                self.received,
-                verbose
-            );
-        } else {
+        let Ok(icmp_repr) = maybe_icmp_repr else {
             println!("ignored packet");
+            return;
+        };
+
+        let Icmpv6Repr::EchoReply { seq_no, data, .. } = icmp_repr else {
+            return;
+        };
+
+        if self.waiting_queue.get(&seq_no).is_none() {
+            return;
         }
+
+        let packet_timestamp_ms = NetworkEndian::read_i64(data);
+        let rtt = now.total_millis() - packet_timestamp_ms;
+        self.rtt.add_rtt(rtt as f64 * 0.001);
+        self.waiting_queue.remove(&seq_no);
     }
 
     fn is_finished(&self) -> bool {
@@ -488,6 +559,7 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
             if now - *from < self.timeout {
                 true
             } else {
+                self.rtt.add_lost_package();
                 if verbose {
                     println!("From {remote_addr} icmp_seq={seq} timeout");
                 }
@@ -758,6 +830,8 @@ fn main() {
     network_states[1].add_task(ping_task2);
 
     run_tasks_to_completion(&mut network_states, verbose);
+
+    println!("{}", network_states[0].tasks.clone().borrow()[0].rtt.avg_packageloss().unwrap_or(f64::NAN));
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr, verbose: bool) {
