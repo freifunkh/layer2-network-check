@@ -339,7 +339,6 @@ struct PingTask<'a> {
     socket_handle: SocketHandle,
 
     // static data
-    num_pings: u16,
     remote_addr: &'a Ipv6Address,
     ident: u16,
     interval: Duration,
@@ -348,7 +347,6 @@ struct PingTask<'a> {
     // dynamic data
     send_next_at: Instant,
     seq_no: u16,
-    received: u16,
     waiting_queue: HashMap<u16, Instant>,
 
     // result data
@@ -435,14 +433,12 @@ impl<'a> PingTask<'a> {
 
         PingTask {
             socket_handle: socket_handle,
-            num_pings: 60,
             remote_addr: remote_addr,
             ident: ident,
             interval: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             send_next_at: Instant::now(),
             seq_no: 0,
-            received: 0,
             waiting_queue: HashMap::new(),
             rtt: SlidingWindowRTT::new(30),
         }
@@ -454,10 +450,6 @@ impl<'a> PingTask<'a> {
 
     fn get_socket<'b>(&self, network_state: &'b NetworkState<'a>) -> &'b icmp::Socket {
         network_state.sockets.get::<icmp::Socket>(self.socket_handle)
-    }
-
-    fn all_pings_sent(&self) -> bool {
-        self.seq_no >= self.num_pings
     }
 }
 
@@ -472,7 +464,7 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
     }
 
     fn maybe_send<'b>(&mut self, now: Instant, network_state: &'b mut NetworkState<'a>) {
-        if self.send_next_at > now || self.seq_no >= self.num_pings {
+        if self.send_next_at > now {
             return;
         }
 
@@ -540,18 +532,10 @@ impl<'a> NetworkTask<'a> for PingTask<'a> {
     }
 
     fn is_finished(&self) -> bool {
-        self.all_pings_sent() && self.waiting_queue.is_empty()
+        false // run infinitely
     }
 
     fn next_wakeup_at(&self) -> Option<Instant> {
-        if self.is_finished() {
-            return None;
-        }
-
-        if self.all_pings_sent() {
-            return Some(self.waiting_queue.values().min().unwrap().clone() + self.timeout);
-        }
-
         return Some(self.send_next_at);
     }
 
