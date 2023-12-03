@@ -4,7 +4,9 @@ mod utils;
 extern crate libc;
 
 use std::cell::RefCell;
+use std::net::TcpListener;
 use std::os::unix::io::RawFd;
+use std::io::{Write, Error};
 
 use std::{cmp, mem, io, ptr};
 use std::collections::HashMap;
@@ -37,7 +39,7 @@ use rand::Rng;
 
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.
-pub fn wait_fds(fds: Vec<RawFd>, duration: Option<Duration>) -> io::Result<()> {
+pub fn wait_fds(fds: &Vec<RawFd>, duration: Option<Duration>) -> io::Result<()> {
     unsafe {
         let mut readfds = {
             let mut readfds = mem::MaybeUninit::<libc::fd_set>::uninit();
@@ -433,7 +435,7 @@ impl<'a> PingTask<'a> {
 
         PingTask {
             socket_handle: socket_handle,
-            num_pings: 4,
+            num_pings: 60,
             remote_addr: remote_addr,
             ident: ident,
             interval: Duration::from_secs(1),
@@ -666,6 +668,11 @@ fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
 
 
 fn run_tasks_to_completion<'a>(network_states: &mut Vec<NetworkState<'a>>, verbose: bool) {
+    let listener = TcpListener::bind("127.0.0.1:12123").expect("Error during bind of the TcpListener");
+    listener.set_nonblocking(true).expect("Cannot set non-blocking");
+
+    let mut fds = network_states.get_fds();
+    fds.push(listener.as_raw_fd());
 
     loop {
         let now = Instant::now();
@@ -697,8 +704,28 @@ fn run_tasks_to_completion<'a>(network_states: &mut Vec<NetworkState<'a>>, verbo
 
         let poll_at = min_poll_at.unwrap();
 
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    for network_state in network_states.iter() {
+                        let network_tasks = network_state.tasks.clone();
+                        for task in network_tasks.borrow().iter() {
+                            writeln!(stream, "netcheck_packageloss {}", task.rtt.avg_packageloss().unwrap_or(f64::NAN));
+                            writeln!(stream, "netcheck_rtt {}", task.rtt.avg_rtt().unwrap_or(f64::NAN));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::WouldBlock {
+                        eprintln!("Fehler beim Akzeptieren einer Verbindung: {}", e);
+                    }
+                    break;
+                }
+            }
+        }
+
         if now < poll_at {
-            wait_fds(network_states.get_fds(), Some(poll_at - now)).expect("error during wait");
+            wait_fds(&fds, Some(poll_at - now)).expect("error during wait");
         }
     }
 }
@@ -830,8 +857,6 @@ fn main() {
     network_states[1].add_task(ping_task2);
 
     run_tasks_to_completion(&mut network_states, verbose);
-
-    println!("{}", network_states[0].tasks.clone().borrow()[0].rtt.avg_packageloss().unwrap_or(f64::NAN));
 }
 
 fn set_ipv6_addr(iface: &mut Interface, cidr: Ipv6Cidr, verbose: bool) {
