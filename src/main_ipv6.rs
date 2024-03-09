@@ -6,7 +6,7 @@ extern crate libc;
 use std::cell::RefCell;
 use std::net::TcpListener;
 use std::os::unix::io::RawFd;
-use std::io::{Write, Error};
+use std::io::{Write, Error, Read};
 
 use std::{cmp, mem, io, ptr};
 use std::collections::HashMap;
@@ -32,10 +32,13 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::str::FromStr;
 use std::env;
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
 
 use rand::Rng;
+
+use serde_derive::{Deserialize, Serialize};
+use std::net::Ipv6Addr;
 
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.
@@ -239,7 +242,7 @@ struct NetworkState<'a> {
     iface: Interface,
     fd: i32,
 
-    tasks: Rc<RefCell<Vec<PingTask<'a>>>>,
+    tasks: Rc<RefCell<Vec<PingTask>>>,
 }
 
 impl<'a> NetworkState<'a> {
@@ -282,7 +285,7 @@ impl<'a> NetworkState<'a> {
         return res;
     }
 
-    fn add_task(&mut self, task: PingTask<'a>) {
+    fn add_task(&mut self, task: PingTask) {
         self.tasks.borrow_mut().push(task);
     }
 
@@ -335,11 +338,11 @@ trait NetworkTask<'a> {
     fn next_wakeup_at(&self) -> Option<Instant>;
 }
 
-struct PingTask<'a> {
+struct PingTask {
     socket_handle: SocketHandle,
 
     // static data
-    remote_addr: &'a Ipv6Address,
+    remote_addr: Ipv6Address,
     ident: u16,
     interval: Duration,
     timeout: Duration,
@@ -417,8 +420,8 @@ impl SlidingWindowRTT {
     }
 }
 
-impl<'a> PingTask<'a> {
-    fn new(network_state: &mut NetworkState<'a>, remote_addr: &'a Ipv6Address) -> PingTask<'a> {
+impl<'a> PingTask {
+    fn new(network_state: &mut NetworkState<'a>, remote_addr: Ipv6Address) -> PingTask {
         let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
         let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
 
@@ -448,12 +451,12 @@ impl<'a> PingTask<'a> {
         network_state.sockets.get_mut::<icmp::Socket>(self.socket_handle)
     }
 
-    fn get_socket<'b>(&self, network_state: &'b NetworkState<'a>) -> &'b icmp::Socket {
+    fn get_socket<'b>(&'b self, network_state: &'b NetworkState<'a>) -> &icmp::Socket {
         network_state.sockets.get::<icmp::Socket>(self.socket_handle)
     }
 }
 
-impl<'a> NetworkTask<'a> for PingTask<'a> {
+impl<'a> NetworkTask<'a> for PingTask {
 
     fn can_send<'b>(&self, network_state: &'b NetworkState<'a>) -> bool {
         self.get_socket(network_state).can_send()
@@ -714,7 +717,46 @@ fn run_tasks_to_completion<'a>(network_states: &mut Vec<NetworkState<'a>>, verbo
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Target {
+    ip: Ipv6Addr,
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Context {
+    iface: String,
+    source_ip: Ipv6Addr,
+    source_netmask_length: u8,
+    gateway: Option<Ipv6Addr>,
+    name: String,
+    #[serde(default)]
+    targets: Vec<Target>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Conf {
+    context: Vec<Context>
+}
+
+fn get_iface_mac(iface_name: &str) -> EthernetAddress {
+    let mac_str_file_content = fs::read_to_string(
+        Path::new("/sys/class/net/")
+            .join(&iface_name)
+            .join("address")).expect(format!("Iface {} does not exist.", iface_name).as_str());
+    let mac_str = mac_str_file_content.strip_suffix("\n").unwrap().to_owned();
+    EthernetAddress::from_str(mac_str.as_str()).unwrap()
+}
+
 fn main() {
+
+    let file_path = "config.toml";
+
+    let mut file = File::open(file_path).expect("Failed to open config.toml.");
+    let mut toml_data = String::new();
+    file.read_to_string(&mut toml_data).expect("Failed to read config.toml.");
+
+    let parsed_data: Conf = toml::from_str(&toml_data).expect("Failed to parse TOML");
 
     let (mut opts, _) = utils::create_options();
 
@@ -773,72 +815,31 @@ fn main() {
         .unwrap_or("wlp3s0".into());
     let verbose = args.opt_present("verbose");
 
+    let mut network_states: Vec<NetworkState<'_>> = vec![];
 
-    let mac_str = match args.opt_str("mac") {
-        Some(mac_str) => mac_str,
-        None => {
-            let mac_str_file_content = fs::read_to_string(
-                Path::new("/sys/class/net/")
-                    .join(&iface_name)
-                    .join("address")).unwrap();
-            mac_str_file_content.strip_suffix("\n").unwrap().to_owned()
-        }
-    };
+    for context in parsed_data.context {
+        let mac = get_iface_mac(&context.iface);
+        let mut network_state = NetworkState::new(&context.iface, &mac);
 
-    let mac = EthernetAddress::from_str(mac_str.as_str()).unwrap();
-    if verbose {
-        println!("Using MAC: {}.", mac_str);
-    }
-
-    let ll_prefix = &IPV6_PREFIX_LINK_LOCAL_UNICAST;
-    let ll_addr = Ipv6Cidr::new(
-        ipv6_from_prefix(ll_prefix, &mac),
-        64
-    );
-
-    let network_state = NetworkState::new(&iface_name, &mac);
-    let network_state2 = NetworkState::new(&iface_name, &mac);
-
-    let mut network_states = vec![network_state, network_state2];
-
-    set_ipv6_addr(&mut network_states[0].iface, ll_addr, verbose);
-    set_ipv6_addr(&mut network_states[1].iface, ll_addr, verbose);
-
-    let ra_result = obtain_public_ip6_via_ra(
-        &mut network_states[0],
-        &remote_addr,
-        &mac,
-        verbose
-    );
-
-    if ra_result.is_none() {
         if verbose {
-            println!("Did not obtain a public ip via RA.");
+            println!("Using MAC: {}.", mac.to_string());
         }
-        std::process::exit(1);
+
+        let cidr = Ipv6Cidr::new(context.source_ip.into(), context.source_netmask_length);
+
+        set_ipv6_addr(&mut network_state.iface, cidr, verbose);
+
+        if let Some(default_router) = context.gateway {
+            network_state.iface.routes_mut().add_default_ipv6_route(default_router.into()).unwrap();
+        }
+
+        for target in context.targets {
+            let ping_task = PingTask::new(&mut network_state, target.ip.into());
+            network_state.add_task(ping_task);
+        }
+
+        network_states.push(network_state);
     }
-
-    let (selected_ip, selected_router) = ra_result.unwrap();
-
-    if verbose {
-        println!("Assigned IP: {}", selected_ip);
-        println!("Assigned Router: {}", selected_router);
-    }
-
-    set_ipv6_addr(&mut network_states[0].iface, selected_ip, verbose);
-    set_ipv6_addr(&mut network_states[1].iface, selected_ip, verbose);
-
-    network_states[0].iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
-    network_states[1].iface.routes_mut().add_default_ipv6_route(selected_router).unwrap();
-
-    let remote_addr = Ipv6Address(
-        [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x44]); // from("2001:4860:4860:0:0:0:0:8844");
-
-    let ping_task = PingTask::new(&mut network_states[0], &remote_addr);
-    let ping_task2 = PingTask::new(&mut network_states[1], &remote_addr);
-
-    network_states[0].add_task(ping_task);
-    network_states[1].add_task(ping_task2);
 
     run_tasks_to_completion(&mut network_states, verbose);
 }

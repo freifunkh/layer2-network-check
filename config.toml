@@ -1,0 +1,14 @@
+[[context]]
+iface = "wlp3s0"
+source_ip = "2003:cd:738:2f00::1337"
+source_netmask_length = 64
+gateway = "fe80::1eed:6fff:fe3f:3d0b"
+name = "Local Network"
+  
+  [[context.targets]]
+  ip = "fe80::1eed:6fff:fe3f:3d0b"
+  name = "Gateway"
+
+  [[context.targets]]
+  ip = "2001:4860:4860::8844"
+  name = "Server 1"
