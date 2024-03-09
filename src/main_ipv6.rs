@@ -6,7 +6,7 @@ extern crate libc;
 use std::cell::RefCell;
 use std::net::TcpListener;
 use std::os::unix::io::RawFd;
-use std::io::{Write, Error, Read};
+use std::io::{Write, Read};
 
 use std::{cmp, mem, io, ptr};
 use std::collections::HashMap;
@@ -15,10 +15,10 @@ use std::rc::Rc;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address, IpAddress,
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv6Address,
     NdiscPrefixInformation, Icmpv6Repr, RawHardwareAddress};
 use smoltcp::{
-    phy::{wait as phy_wait, Device, Medium, RawSocket},
+    phy::{Device, Medium, RawSocket},
     time::Duration,
 };
 use smoltcp::socket::icmp::{self, Socket};
@@ -108,29 +108,6 @@ macro_rules! send_icmp_ping {
     }};
 }
 
-macro_rules! get_icmp_pong {
-    ( $repr_type:ident, $repr:expr, $payload:expr, $waiting_queue:expr, $remote_addr:expr,
-      $timestamp:expr, $received:expr, $verbose:expr ) => {{
-        if let $repr_type::EchoReply { seq_no, data, .. } = $repr {
-            if let Some(_) = $waiting_queue.get(&seq_no) {
-                let packet_timestamp_ms = NetworkEndian::read_i64(data);
-                if $verbose {
-                    println!(
-                        "{} bytes from {}: icmp_seq={}, time={}ms",
-                        data.len(),
-                        $remote_addr,
-                        seq_no,
-                        $timestamp.total_millis() - packet_timestamp_ms
-                    );
-                }
-                $waiting_queue.remove(&seq_no);
-                $received += 1;
-            }
-        }
-    }};
-}
-
-const IPV6_PREFIX_LINK_LOCAL_UNICAST : Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
 const EUI64_MIDDLE_VALUE: [u8; 2] = [0xff, 0xfe];
 
 fn min_option<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
@@ -499,7 +476,7 @@ impl<'a> NetworkTask<'a> for PingTask {
         self.send_next_at += self.interval;
     }
 
-    fn maybe_recv(&mut self, now: Instant, network_state: &mut NetworkState<'a>, verbose: bool) {
+    fn maybe_recv(&mut self, now: Instant, network_state: &mut NetworkState<'a>, _verbose: bool) {
 
         let dst_addr = &network_state.iface.ipv6_addr().unwrap().into_address();
         let device_caps = network_state.device.capabilities();
@@ -569,90 +546,6 @@ impl<'a> NetworkTask<'a> for PingTask {
         self.housekeeping(now, verbose);
     }
 }
-
-fn obtain_public_ip6_via_ra(network_state: &mut NetworkState,
-    remote_addr: &Ipv6Address, mac: & EthernetAddress, verbose: bool)
-        -> Option<(Ipv6Cidr, Ipv6Address)>
-{
-    // Create sockets
-    let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
-    let icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    let icmp_handle = network_state.sockets.add(icmp_socket);
-
-    let mut send_at = Instant::from_millis(0);
-
-    let mut selected_ip : Option<Ipv6Cidr> = None;
-    let mut selected_router : Option<Ipv6Address> = None;
-
-    let mut ra_remaining_attempts = 3;
-    let ra_timeout = Duration::from_secs(1);
-
-    loop {
-        let timestamp = Instant::now();
-        network_state.iface.poll(timestamp, &mut network_state.device, &mut network_state.sockets);
-
-        let timestamp = Instant::now();
-        let socket = network_state.sockets.get_mut::<icmp::Socket>(icmp_handle);
-        if !socket.is_open() {
-            socket.bind(icmp::Endpoint::IPv6Ndisc).unwrap();
-            socket.set_hop_limit(Some(255));
-            send_at = timestamp;
-        }
-
-        if socket.can_send() && send_at <= timestamp {
-
-            if ra_remaining_attempts < 1 {
-                break;
-            }
-
-            ra_remaining_attempts -= 1;
-
-            emit_ipv6_rs(socket, &remote_addr, &mac);
-
-            if verbose {
-                println!("Sent RS to {}", remote_addr);
-            }
-
-            send_at = Instant::now() + ra_timeout;
-        }
-
-        if socket.can_recv() {
-            let (payload, source_addr) = socket.recv().unwrap();
-
-            let ip6_source_addr = match source_addr {
-                IpAddress::Ipv6(ip6) => ip6,
-                _ => {
-                    break;
-                }
-            };
-
-            if *remote_addr != Ipv6Address::LINK_LOCAL_ALL_ROUTERS && ip6_source_addr != *remote_addr {
-                if verbose {
-                    println!("Wrong source address. Ignoring.");
-                }
-                continue;
-            }
-
-            selected_ip = parse_ipv6_ra_get_public_ipv6(&payload, &mac, verbose);
-            if selected_ip.is_some() {
-                selected_router = Some(ip6_source_addr);
-                break;
-            }
-        }
-
-        phy_wait(network_state.fd, network_state.iface.poll_delay(timestamp, &network_state.sockets)).expect("wait error");
-    }
-
-    network_state.sockets.remove(icmp_handle);
-
-    if selected_ip.is_some() {
-        return Some((selected_ip.unwrap(), selected_router.unwrap()));
-    }
-
-    None
-}
-
 
 fn run_tasks_to_completion<'a>(network_states: &mut Vec<NetworkState<'a>>, verbose: bool) {
     let listener = TcpListener::bind("127.0.0.1:12123").expect("Error during bind of the TcpListener");
@@ -761,24 +654,6 @@ fn main() {
     let (mut opts, _) = utils::create_options();
 
     opts.optopt(
-        "r",
-        "remote",
-        "destination to send RA to",
-        "LL_ADDR",
-    );
-    opts.optopt(
-        "i",
-        "interface",
-        "iface to open raw socket on",
-        "IFACE"
-    );
-    opts.optopt(
-        "m",
-        "mac",
-        "mac to use for the raw socket",
-        "MAC"
-    );
-    opts.optopt(
         "",
         "allowed-drops",
         "number of icmp ping packets that can be lost while the return code is still ok. (Default: 1)",
@@ -806,13 +681,6 @@ fn main() {
         }
     }
 
-    let remote_addr = args
-        .opt_str("remote")
-        .map(|s| Ipv6Address::from_str(&s).unwrap())
-        .unwrap_or(Ipv6Address::LINK_LOCAL_ALL_ROUTERS);
-    let iface_name = args
-        .opt_str("interface")
-        .unwrap_or("wlp3s0".into());
     let verbose = args.opt_present("verbose");
 
     let mut network_states: Vec<NetworkState<'_>> = vec![];
