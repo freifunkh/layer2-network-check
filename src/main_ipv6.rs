@@ -373,7 +373,7 @@ impl SlidingWindowRTT {
         let mut sum = 0.0;
         let mut count : usize = 0;
         for d in self.data.iter() {
-            if *d == f64::NAN {
+            if d.is_nan() {
                 continue;
             }
             sum += d;
@@ -389,7 +389,7 @@ impl SlidingWindowRTT {
 
         let mut count : usize = 0;
         for d in self.data.iter() {
-            if *d == f64::NAN {
+            if d.is_nan() {
                 count += 1;
             }
         }
