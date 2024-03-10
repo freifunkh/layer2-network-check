@@ -214,6 +214,7 @@ pub fn parse_ipv6_ra_get_public_ipv6(payload: &[u8], mac: &EthernetAddress, verb
 }
 
 struct NetworkState<'a> {
+    name: String,
     sockets: SocketSet<'a>,
     device: RawSocket,
     iface: Interface,
@@ -223,7 +224,7 @@ struct NetworkState<'a> {
 }
 
 impl<'a> NetworkState<'a> {
-    fn new(iface_name: &str, mac: &EthernetAddress) -> NetworkState<'a> {
+    fn new(iface_name: &str, mac: &EthernetAddress, name: String) -> NetworkState<'a> {
         let mut device = RawSocket::new(&iface_name, Medium::Ethernet).unwrap();
         let fd = device.as_raw_fd();
 
@@ -240,6 +241,7 @@ impl<'a> NetworkState<'a> {
         let sockets = SocketSet::new(vec![]);
 
         return NetworkState {
+            name: name,
             sockets: sockets,
             device: device,
             iface: iface,
@@ -316,6 +318,7 @@ trait NetworkTask<'a> {
 }
 
 struct PingTask {
+    name: String,
     socket_handle: SocketHandle,
 
     // static data
@@ -398,7 +401,7 @@ impl SlidingWindowRTT {
 }
 
 impl<'a> PingTask {
-    fn new(network_state: &mut NetworkState<'a>, remote_addr: Ipv6Address) -> PingTask {
+    fn new(network_state: &mut NetworkState<'a>, remote_addr: Ipv6Address, name: String) -> PingTask {
         let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
         let icmp_tx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
 
@@ -412,6 +415,7 @@ impl<'a> PingTask {
         let socket_handle = network_state.sockets.add(socket);
 
         PingTask {
+            name: name,
             socket_handle: socket_handle,
             remote_addr: remote_addr,
             ident: ident,
@@ -590,8 +594,14 @@ fn run_tasks_to_completion<'a>(network_states: &mut Vec<NetworkState<'a>>, verbo
                     for network_state in network_states.iter() {
                         let network_tasks = network_state.tasks.clone();
                         for task in network_tasks.borrow().iter() {
-                            writeln!(stream, "netcheck_packageloss {}", task.rtt.avg_packageloss().unwrap_or(f64::NAN));
-                            writeln!(stream, "netcheck_rtt {}", task.rtt.avg_rtt().unwrap_or(f64::NAN));
+                            let vars = format!("context=\"{}\",target=\"{}\"", network_state.name.replace(" ", "\\ "), task.name.replace(" ", "\\ "));
+                            let packageloss = task.rtt.avg_packageloss().unwrap_or(f64::NAN);
+                            let rtt = task.rtt.avg_rtt().unwrap_or(f64::NAN);
+
+                            let write_res = writeln!(stream, "netcheck,{vars} packageloss={packageloss},rtt={rtt}");
+                            if let Err(err) = write_res {
+                                println!("Tcp socket write failed: {}", err);
+                            }
                         }
                     }
                 }
@@ -687,7 +697,7 @@ fn main() {
 
     for context in parsed_data.context {
         let mac = get_iface_mac(&context.iface);
-        let mut network_state = NetworkState::new(&context.iface, &mac);
+        let mut network_state = NetworkState::new(&context.iface, &mac, context.name);
 
         if verbose {
             println!("Using MAC: {}.", mac.to_string());
@@ -702,7 +712,7 @@ fn main() {
         }
 
         for target in context.targets {
-            let ping_task = PingTask::new(&mut network_state, target.ip.into());
+            let ping_task = PingTask::new(&mut network_state, target.ip.into(), target.name);
             network_state.add_task(ping_task);
         }
 
